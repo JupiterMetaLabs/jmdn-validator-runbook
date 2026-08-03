@@ -424,6 +424,51 @@
   when: _v_live_exposed is defined
 
 # ------------------------------------------------------------------------------
+# 4d. journald is still bounded and still not dropping messages
+#
+# A distro upgrade replacing journald.conf, or someone removing the drop-in, both
+# revert this silently. The rate limit is the part worth asserting: exceeded, it
+# DISCARDS log lines, and the only evidence is a "Suppressed N messages" entry.
+# ------------------------------------------------------------------------------
+- name: "verify | Read journald's effective configuration"
+  ansible.builtin.command: systemd-analyze cat-config systemd/journald.conf
+  register: _v_jd
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "verify | journald retention is still configured"
+  ansible.builtin.assert:
+    that:
+      - journald_dropin_name in (_v_jd.stdout | default(''))
+    fail_msg: >-
+      journald's retention drop-in is missing from the effective configuration.
+      The journal has reverted to distro defaults, which means it discards
+      messages beyond 10000 per 30s per service — so logs get silently truncated
+      during exactly the bursts you would want to read. Re-run observability.yml.
+      Check: systemd-analyze cat-config systemd/journald.conf
+    quiet: true
+  when: _v_jd.rc | default(1) == 0
+
+- name: "verify | Report any suppressed log messages"
+  ansible.builtin.command: journalctl --since '24 hours ago' --grep 'Suppressed [0-9]+ messages'
+  register: _v_supp
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "verify | journald dropped messages in the last 24h"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: journald reported suppressed messages in the last 24 hours — log
+      lines were discarded. Raise journald_rate_limit_burst (currently
+      {{ journald_rate_limit_burst | default("unset") }}) and re-run
+      observability.yml. Detail: journalctl --grep 'Suppressed'
+  when:
+    - _v_supp.rc | default(1) == 0
+    - (_v_supp.stdout | default('') | trim) | length > 0
+
+# ------------------------------------------------------------------------------
 # 5. Block height advancing — the signal that matters most
 # ------------------------------------------------------------------------------
 # Re-scrape rather than reuse the content captured earlier in the play: several

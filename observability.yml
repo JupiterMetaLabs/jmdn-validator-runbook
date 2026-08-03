@@ -26,6 +26,10 @@
 
     - role: preflight
       tags: [preflight]
+    # Bound the journal and stop it discarding logs under load, BEFORE the
+    # services below start writing to it.
+    - role: journald
+
     - role: node_exporter
       tags: [node_exporter, metrics]
     - role: jmdn_health_collector

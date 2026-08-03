@@ -28,6 +28,11 @@ Two long-running services and one timer, on top of the node itself.
 | `otelcol-contrib` | sends telemetry to Jupiter Meta | `127.0.0.1` only | 256 MB / 20% of a core |
 | `jmdn-health.timer` | 30-second health check | nothing | no resident memory |
 
+`observability.yml` also bounds your system journal, because five services log to
+it and the distro default **discards** messages beyond 10,000 per 30 seconds per
+service — silently truncating logs during exactly the bursts you would want to
+read. Details in [docs/DESIGN.md](docs/DESIGN.md); nothing for you to run.
+
 Measured across two 2 vCPU installs: node_exporter **8.6–9.0 MB**, the agent
 **36–41 MB**. The caps are 6–9× that, sized so a leak can never compete with
 your node for resources.

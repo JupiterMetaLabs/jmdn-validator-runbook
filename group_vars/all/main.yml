@@ -46,6 +46,25 @@ jmdn_nologin_shell: >-
 # how the resolution and drift logic get exercised without touching a live node.
 jmdn_config_path: /etc/jmdn/jmdn.yaml
 
+# journald drop-in filename. Read by TWO roles — journald (writes it) and verify
+# (asserts it is still in the effective config) — so it lives here rather than in
+# journald's defaults, where verify would have to duplicate it as a default() and
+# the two could drift apart.
+#
+#   "10-"  systemd applies drop-ins in lexical order across every
+#          journald.conf.d directory, last winning per key. Nothing ships a
+#          competing drop-in on Debian/Ubuntu (/usr/lib, /etc and /run
+#          journald.conf.d are all absent by default), so 10 is early enough that
+#          an operator who disagrees with a value can add 20-mine.conf beside it
+#          and win, without editing our file.
+#
+#   name   identifies the OWNER, not the contents. journald.conf.d is
+#          machine-global, so someone finding a setting here needs to know who
+#          put it there. Contrast the ImmuDB drop-in, which sits inside
+#          immudb.service.d/ where ownership is implicit and so is named for its
+#          effect (10-loopback-only.conf).
+journald_dropin_name: "10-jmdn-validator.conf"
+
 # Resolved by roles/identity, which honours node_id: "auto" by reading node.alias
 # out of jmdn_config_path. The fallback keeps playbooks that run no roles
 # (tests/scope_check.yml) evaluable; set_fact in the role outranks it.

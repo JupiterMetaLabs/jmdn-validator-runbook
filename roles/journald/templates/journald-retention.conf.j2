@@ -1,0 +1,35 @@
+# Managed by jmdn-validator-runbook. Local edits will be overwritten.
+#
+# A DROP-IN, not a replacement for /etc/systemd/journald.conf. This machine is
+# yours: overwriting the distro's file would discard anything you or your distro
+# set there, and would be silently reverted by a package upgrade. A drop-in
+# layers on top and only states what we change.
+#
+# Remove this file and `systemctl restart systemd-journald` to revert entirely.
+[Journal]
+# Explicit rather than relying on /var/log/journal existing, which is what
+# Storage=auto keys off.
+Storage=persistent
+
+# --- Size ---------------------------------------------------------------------
+SystemMaxUse={{ journald_system_max_use }}
+SystemKeepFree={{ journald_system_keep_free }}
+SystemMaxFileSize={{ journald_max_file_size }}
+RuntimeMaxUse={{ journald_runtime_max_use }}
+
+# --- Rate limiting ------------------------------------------------------------
+# Beyond this, journald DISCARDS messages. Raised well above the 10000/30s
+# default so a block-processing burst does not silently truncate the logs you
+# would need to explain it.
+RateLimitIntervalSec={{ journald_rate_limit_interval }}
+RateLimitBurst={{ journald_rate_limit_burst }}
+
+# --- Stop duplicating every line into /var/log/syslog -------------------------
+# This is the one genuinely unbounded path on the box: the journal caps itself,
+# but rsyslog's text files are bounded only by whatever logrotate the distro
+# happens to ship. Forwarding also doubles write volume for no benefit, since
+# the journal is the source of truth here.
+ForwardToSyslog=no
+
+# Don't broadcast emergency messages to every terminal.
+ForwardToWall=no

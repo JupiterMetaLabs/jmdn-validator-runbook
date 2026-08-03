@@ -1,0 +1,74 @@
+---
+# ==============================================================================
+# journald — bound the journal, and stop it discarding logs under load.
+#
+# Runs as part of observability.yml so the operator types nothing extra. It is in
+# scope for this kit for a concrete reason: this kit forwards the node's logs, and
+# a journald rate limit silently truncating them makes both the forwarded copy and
+# the local copy incomplete at the same moment.
+# ==============================================================================
+
+- name: "journald | Ensure the drop-in directory exists"
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "journald | Install the retention drop-in"
+  ansible.builtin.template:
+    src: journald-retention.conf.j2
+    dest: "/etc/systemd/journald.conf.d/{{ journald_dropin_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  # No validate= here on purpose. systemd ships no validator for journald.conf —
+  # `systemd-analyze verify` handles units, and `cat-config` only reads known
+  # prefixes, so it cannot inspect Ansible's temp file. A validate= that cannot
+  # fail is worse than none: it reads like a safety net and is not one. The
+  # read-back below, after the restart, is the real check.
+  notify: "journald config changed"
+
+# Apply the restart NOW rather than at end of play, so the checks below describe
+# the journald that is actually running.
+- name: "journald | Apply the configuration before verifying it"
+  ansible.builtin.meta: flush_handlers
+
+# What this proves and what it does not: `cat-config` merges the files ON DISK, so
+# this confirms the drop-in is in the right directory under the right name and
+# will be picked up. Combined with the flush above it also means journald has
+# restarted since the write. It does NOT read journald's in-memory values —
+# systemd exposes no interface for that — so the runtime effect is inferred from
+# the restart, not measured.
+- name: "journald | Read back the effective configuration"
+  ansible.builtin.command: systemd-analyze cat-config systemd/journald.conf
+  register: _jd_effective
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "journald | The drop-in is part of the effective config"
+  ansible.builtin.assert:
+    that:
+      - journald_dropin_name in (_jd_effective.stdout | default(''))
+    fail_msg: >-
+      /etc/systemd/journald.conf.d/{{ journald_dropin_name }} is not in journald's effective
+      configuration. Check: systemd-analyze cat-config systemd/journald.conf
+    quiet: true
+  when: _jd_effective.rc | default(1) == 0
+
+- name: "journald | Report current journal usage"
+  ansible.builtin.command: journalctl --disk-usage
+  register: _jd_usage
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "journald | Journal usage"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _jd_usage.stdout | default('unknown') }}
+      (capped at {{ journald_system_max_use }};
+      rate limit {{ journald_rate_limit_burst }}/{{ journald_rate_limit_interval }})
+  when: _jd_usage.rc | default(1) == 0

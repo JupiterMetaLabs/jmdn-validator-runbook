@@ -21,6 +21,7 @@
       ansible.builtin.assert:
         that:
           - jmdn_config_path is defined
+          - journald_dropin_name is defined
           - jmdn_health_interval_seconds is defined
           - node_exporter_listen_address is defined
           - otel_agent_self_metrics_address is defined

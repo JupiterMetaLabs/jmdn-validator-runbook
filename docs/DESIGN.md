@@ -359,3 +359,52 @@ short and the whole kit auditable by reading it.
 
 ---
 
+---
+
+## D-18 — Bound the journal, and stop it dropping logs
+
+**Decision:** `observability.yml` installs a journald drop-in. The operator runs
+no extra command.
+
+**Why this is in scope for a telemetry kit:** this kit forwards your node's logs.
+A journald rate limit truncates the local copy and the forwarded copy at the same
+instant, so log retention is not somebody else's problem here.
+
+**The setting that matters is the rate limit, not the size.** journald discards
+messages beyond `RateLimitBurst` per `RateLimitIntervalSec` **per service**,
+recording only "Suppressed N messages". The default is 10,000/30s ≈ 333/s. A
+validator at idle was measured at ~2,200 lines/hour from `jmdn` alone (~18 per
+30s), so the default looks generous — but the moment that matters is a
+block-processing burst, and losing *new* logs during an incident is worse than
+losing old ones. Raised to 100,000/30s ≈ 3,300/s: ~180x measured idle,
+deliberately finite rather than `0`, so a pathological log loop still cannot
+saturate disk I/O.
+
+**Sizing, from the measurement rather than a guess.** ~10–18 MB/day at idle.
+`SystemMaxUse=2G` is ~110 days at that rate and a few days under a heavy burst.
+Chosen over systemd's implicit 4 GB because `/opt` shares the filesystem with the
+chain database, which only grows, and the journal is not the system of record —
+logs also reach Jupiter Meta.
+
+**`ForwardToSyslog=no` is the only unbounded-growth fix here.** The journal caps
+itself; rsyslog's `/var/log/syslog` is bounded only by whatever logrotate the
+distro ships. Forwarding also doubles write volume for no benefit.
+
+**A drop-in, not a replacement for `journald.conf`.** The operator's machine is
+theirs: overwriting the distro file would discard their settings and be reverted
+by a package upgrade. `rm` the drop-in and restart journald to revert completely.
+
+**Deliberately not set:** `Compress` and `SyncIntervalSec` are already the
+defaults, and restating a default just creates a value that can drift out of sync
+with systemd. `MaxRetentionSec` is omitted because size binds first under load
+and an age cap would discard logs we could keep for free at idle. `MaxFileSec` is
+omitted because `SystemMaxFileSize` is sufficient — one rotation trigger is easier
+to reason about than two.
+
+`SystemKeepFree` is expressed as `15%` rather than an absolute size so it scales
+with whatever disk the operator provisioned.
+
+**Verified by:** `observability.yml` asserts the drop-in appears in
+`systemd-analyze cat-config`, and `verify.yml` re-asserts it on every run plus
+reports any "Suppressed" entries from the last 24 hours — a distro upgrade
+replacing `journald.conf` would otherwise revert this silently.
