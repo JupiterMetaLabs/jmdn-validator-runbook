@@ -5,31 +5,38 @@
 # set there, and would be silently reverted by a package upgrade. A drop-in
 # layers on top and only states what we change.
 #
+# SCOPE: this file sets ONLY directives that no other component on a JMDN node
+# sets. jmdn's own Scripts/install_services.sh writes
+# /etc/systemd/journald.conf.d/jmdn-limits.conf (SystemMaxUse, MaxRetentionSec),
+# and that filename sorts AFTER this one, so anything we wrote for those keys
+# would be silently overridden. Total journal size is jmdn's to own; the rate
+# limit is ours, and it is the directive that actually loses data.
+# See docs/DESIGN.md D-18.
+#
 # Remove this file and `systemctl restart systemd-journald` to revert entirely.
 [Journal]
 # Explicit rather than relying on /var/log/journal existing, which is what
-# Storage=auto keys off.
+# Storage=auto keys off. Without it a missing directory silently downgrades the
+# journal to RAM-only and every log is lost on reboot.
 Storage=persistent
 
 # --- Size ---------------------------------------------------------------------
-SystemMaxUse={{ journald_system_max_use }}
-SystemKeepFree={{ journald_system_keep_free }}
+# SystemMaxUse is deliberately absent: jmdn-limits.conf owns it.
+#
+# SystemKeepFree is deliberately absent: journald's parser rejects a percentage
+# here — "Failed to parse SystemKeepFree=15%, ignoring: Invalid argument" —
+# observed on Ubuntu 26.04. The man page states the DEFAULT as 15% of the
+# filesystem, which is the behaviour we wanted, so the correct action is to not
+# set it rather than to hard-code an absolute size that cannot scale.
 SystemMaxFileSize={{ journald_max_file_size }}
 RuntimeMaxUse={{ journald_runtime_max_use }}
 
 # --- Rate limiting ------------------------------------------------------------
 # Beyond this, journald DISCARDS messages. Raised well above the 10000/30s
 # default so a block-processing burst does not silently truncate the logs you
-# would need to explain it.
+# would need to explain it. Nothing else on a JMDN node sets these.
 RateLimitIntervalSec={{ journald_rate_limit_interval }}
 RateLimitBurst={{ journald_rate_limit_burst }}
-
-# --- Stop duplicating every line into /var/log/syslog -------------------------
-# This is the one genuinely unbounded path on the box: the journal caps itself,
-# but rsyslog's text files are bounded only by whatever logrotate the distro
-# happens to ship. Forwarding also doubles write volume for no benefit, since
-# the journal is the source of truth here.
-ForwardToSyslog=no
 
 # Don't broadcast emergency messages to every terminal.
 ForwardToWall=no

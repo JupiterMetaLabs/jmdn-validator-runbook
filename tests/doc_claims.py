@@ -125,12 +125,59 @@ claim("both switches TELEMETRY names exist",
       ex['telemetry']['forward_node_logs'] is True and 'forward_node_logs' in tm
       and 'logging.otel.enabled' in tm)
 
+print("-- journald: one source of truth --")
+jd_def = load('roles/journald/defaults/main.yml')
+jd_tpl = text('roles/journald/templates/journald-retention.conf.j2')
+
+
+def jinja_lit(v, scope):
+    """Resolve '{{ var }}' or '{{ var | string }}' against scope; pass literals through."""
+    m = re.fullmatch(r'\{\{\s*([a-z_]+)\s*(?:\|\s*string\s*)?\}\}', str(v).strip())
+    return str(scope[m.group(1)]) if m else str(v)
+
+
+# The role defaults are a deliberate mirror of group_vars (so the role runs
+# standalone). Mirrors drift; this is the only thing that stops it.
+for k in ('journald_dropin_name', 'journald_max_file_size', 'journald_rate_limit_interval',
+          'journald_rate_limit_burst', 'journald_runtime_max_use', 'journald_directives'):
+    claim(f"group_vars and journald defaults agree on {k}",
+          gv[k] == jd_def[k], f"gv={gv[k]!r} role={jd_def[k]!r}")
+
+# The assertion in the role and in verify.yml is only as good as this map matching
+# what the template actually writes. A directive added to one and not the other
+# would be either unasserted or asserted-but-absent.
+tpl_directives = {m.group(1): jinja_lit(m.group(2), gv)
+                  for m in re.finditer(r'^([A-Za-z][A-Za-z0-9]*)=(.+)$', jd_tpl, re.M)}
+map_directives = {k: jinja_lit(v, gv) for k, v in gv['journald_directives'].items()}
+claim("every directive the template writes is asserted, and vice versa",
+      tpl_directives == map_directives,
+      f"template={tpl_directives} map={map_directives}")
+
+# Absences that are load-bearing, not oversights — see group_vars for each.
+# SystemKeepFree in particular is a real key whose value journald rejects, so it
+# is present-and-broken rather than absent if it ever comes back.
+for absent, why in (('SystemMaxUse', "jmdn-limits.conf owns it"),
+                    ('MaxRetentionSec', "jmdn-limits.conf owns it"),
+                    ('SystemKeepFree', "journald rejects a percentage"),
+                    ('ForwardToSyslog', "the distro's to set")):
+    claim(f"template does not set {absent} ({why})", absent not in tpl_directives)
+
+claim("DESIGN documents jmdn's competing drop-in by name",
+      'jmdn-limits.conf' in dz and 'install_services.sh' in dz)
+
 print("-- safety guarantees --")
 vt = text('roles/verify/tasks/main.yml')
 mods = set(re.findall(r'^\s+ansible\.builtin\.([a-z_]+):', vt, re.M))
-READONLY = {'assert', 'debug', 'set_fact', 'stat', 'slurp', 'uri', 'command', 'service_facts', 'pause'}
+# shell is allowed only because every shell body is scanned below, exactly like
+# command. Adding it to this set without that scan would gut the guarantee.
+READONLY = {'assert', 'debug', 'set_fact', 'stat', 'slurp', 'uri', 'command',
+            'service_facts', 'pause', 'shell'}
 cmds = re.findall(r'ansible\.builtin\.command:\s*(.+)', vt)
-mutating_cmds = [x for x in cmds
+shells = re.findall(r'ansible\.builtin\.shell:\s*\|\n(.*?)\n  [a-z]', vt, re.S)
+claim("every shell task in verify was found by the scanner",
+      len(shells) == len(re.findall(r'ansible\.builtin\.shell:', vt)),
+      f"blocks={len(shells)} tasks={len(re.findall(r'ansible.builtin.shell:', vt))}")
+mutating_cmds = [x for x in cmds + shells
                  if re.search(r'\b(restart|start|stop|enable|disable|rm|mv|cp|tee|chmod|chown)\b', x)]
 # service_facts merely READS unit state; matching on the substring "service"
 # would flag it, which is why this enumerates modules instead of pattern-matching.

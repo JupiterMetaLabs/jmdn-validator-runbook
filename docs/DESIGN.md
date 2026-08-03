@@ -359,9 +359,7 @@ short and the whole kit auditable by reading it.
 
 ---
 
----
-
-## D-18 — Bound the journal, and stop it dropping logs
+## D-18 — Stop journald dropping logs under load
 
 **Decision:** `observability.yml` installs a journald drop-in. The operator runs
 no extra command.
@@ -380,31 +378,54 @@ losing old ones. Raised to 100,000/30s ≈ 3,300/s: ~180x measured idle,
 deliberately finite rather than `0`, so a pathological log loop still cannot
 saturate disk I/O.
 
-**Sizing, from the measurement rather than a guess.** ~10–18 MB/day at idle.
-`SystemMaxUse=2G` is ~110 days at that rate and a few days under a heavy burst.
-Chosen over systemd's implicit 4 GB because `/opt` shares the filesystem with the
-chain database, which only grows, and the journal is not the system of record —
-logs also reach Jupiter Meta.
+**Total journal size is not ours to set.** jmdn's own
+`Scripts/install_services.sh:83` already writes a second drop-in,
+`/etc/systemd/journald.conf.d/jmdn-limits.conf`, containing
+`SystemMaxUse=5G` and `MaxRetentionSec=30d`. systemd merges drop-ins in
+**lexical filename order** and the last assignment of a key wins, so
+`jmdn-limits.conf` beats `10-jmdn-validator.conf` — and beats a `99-` prefix too,
+since every digit sorts before every letter.
 
-**`ForwardToSyslog=no` is the only unbounded-growth fix here.** The journal caps
-itself; rsyslog's `/var/log/syslog` is bounded only by whatever logrotate the
-distro ships. Forwarding also doubles write volume for no benefit.
+The first version of this role set `SystemMaxUse=2G` anyway. On a live node
+journald reported `max 5G`: jmdn's value won, the role's own summary line printed
+"capped at 2G", and the assertion passed because it only checked that our
+*filename* appeared in `cat-config`. Presence is not effect.
+
+The fix is not a rename. Winning a fight over a key another component
+deliberately sets is still two components fighting; 5 GB with 30-day retention on
+the 100 GB disk this runbook specifies is not a problem worth having. So this role
+sets only directives nothing else on a JMDN node sets, and **asserts the effective
+value** of each — resolving the merge the way systemd does rather than checking
+for its own filename.
+
+**Deliberately not set, each for its own reason:**
+
+| Directive | Why not |
+|---|---|
+| `SystemMaxUse`, `MaxRetentionSec` | `jmdn-limits.conf` owns them and wins on filename order |
+| `SystemKeepFree` | journald's parser **rejects a percentage**: `Failed to parse SystemKeepFree=15%, ignoring: Invalid argument`, observed on Ubuntu 26.04. The man page states the *default* as 15% of the filesystem, which is the behaviour wanted, so not setting it beats hard-coding a size that cannot scale |
+| `ForwardToSyslog` | a drop-in sorting after ours sets `yes` on a stock node. The earlier claim here — that `/var/log/syslog` is "the only unbounded path" — was never verified, and Ubuntu ships logrotate for rsyslog. Fighting an unidentified component over a key, on a claim that was not checked, is not a trade worth making |
+| `Compress`, `SyncIntervalSec` | already the defaults; restating one creates a value that can drift out of sync with systemd |
+| `MaxFileSec` | `SystemMaxFileSize` is sufficient — one rotation trigger is easier to reason about than two |
 
 **A drop-in, not a replacement for `journald.conf`.** The operator's machine is
 theirs: overwriting the distro file would discard their settings and be reverted
 by a package upgrade. `rm` the drop-in and restart journald to revert completely.
 
-**Deliberately not set:** `Compress` and `SyncIntervalSec` are already the
-defaults, and restating a default just creates a value that can drift out of sync
-with systemd. `MaxRetentionSec` is omitted because size binds first under load
-and an age cap would discard logs we could keep for free at idle. `MaxFileSec` is
-omitted because `SystemMaxFileSize` is sufficient — one rotation trigger is easier
-to reason about than two.
+**Verified by three checks, each covering a way the previous one failed:**
 
-`SystemKeepFree` is expressed as `15%` rather than an absolute size so it scales
-with whatever disk the operator provisioned.
+1. **journald accepted every line.** After the restart, its own messages are read
+   back filtered on its *current* `MainPID` and asserted free of `Failed to parse`
+   and `Unknown key name`. A rejected directive is otherwise invisible — the file
+   is correct on disk, `cat-config` shows the line, the service is active, and the
+   value simply never applies. This is what `SystemKeepFree=15%` did.
+2. **Our value is the winning value.** `cat-config` is reduced to one assignment
+   per key, last-wins, and compared against `journald_directives`. This is what
+   catches an override by a later drop-in.
+3. **`verify.yml` re-runs both** on every invocation, plus reports any "Suppressed
+   N messages" entries from the last 24 hours — the only evidence journald leaves
+   when it discards logs.
 
-**Verified by:** `observability.yml` asserts the drop-in appears in
-`systemd-analyze cat-config`, and `verify.yml` re-asserts it on every run plus
-reports any "Suppressed" entries from the last 24 hours — a distro upgrade
-replacing `journald.conf` would otherwise revert this silently.
+`tests/doc_claims.py` closes the loop statically: it asserts the assertion map
+matches the directives the template actually writes, that the role defaults mirror
+`group_vars`, and that each of the four deliberate absences is still absent.

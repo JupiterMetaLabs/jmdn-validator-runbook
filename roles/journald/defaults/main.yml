@@ -1,60 +1,34 @@
 ---
 # ==============================================================================
-# journald retention for a validator.
+# journald role defaults.
 #
-# Every service on this box logs to the journal — jmdn, immudb, redis-server,
-# and the three units this kit installs. Left at distro defaults that is bounded
-# but not tuned, and one default actively loses data under load.
+# These are a MIRROR of group_vars/all/main.yml, which outranks them. They exist
+# only so the role still works if it is run standalone, outside this repo's
+# inventory — the same convention every other role here follows.
 #
-# Measured on a real validator at idle: jmdn alone emits ~2,200 lines/hour,
-# roughly 10-18 MB/day. The numbers below are chosen against that, not copied.
+# The reasoning behind each value, and the list of directives deliberately NOT
+# set (SystemMaxUse and MaxRetentionSec are jmdn's; SystemKeepFree cannot take a
+# percentage; ForwardToSyslog is the distro's), lives in group_vars/all/main.yml.
+# Read it there rather than duplicating it here.
+#
+# tests/doc_claims.py asserts these literals match group_vars, and that
+# journald_directives matches what the template actually writes, so neither the
+# mirror nor the assertion contract can drift unnoticed.
 # ==============================================================================
 
-# Total journal size. systemd's default is 10% of the filesystem capped at 4 GB.
-#
-# 2 GB rather than 4: /opt shares this filesystem with the chain database, which
-# only grows, and the journal is not the system of record — logs are also
-# forwarded to Jupiter Meta. At the measured idle rate 2 GB is ~110 days; under a
-# heavy block-processing burst it is days, which is the right trade because the
-# alternative is stealing space the chain needs.
-journald_system_max_use: "2G"
+journald_dropin_name: "10-jmdn-validator.conf"
 
-# Stop writing if free space would drop below this. Expressed as a PERCENTAGE
-# rather than an absolute size so it scales with whatever disk the operator
-# actually provisioned — an absolute "10G" is a very different policy on a 100 GB
-# disk than on a 500 GB one. This is systemd's own default behaviour, stated
-# explicitly so it survives a distro changing its mind.
-journald_system_keep_free: "15%"
-
-# Rotate individual files at this size. Keeps any single file quick to search and
-# lets vacuuming reclaim space in reasonable increments.
 journald_max_file_size: "100M"
-
-# --- The setting that actually matters ----------------------------------------
-# journald DROPS messages beyond RateLimitBurst per RateLimitIntervalSec per
-# service, logging "Suppressed N messages". The default is 10000/30s = 333/sec.
-#
-# Idle measures ~18 per 30s, so the default looks generous — but a block-
-# processing burst is exactly when logs matter and exactly when a per-service
-# cap bites. Losing NEW logs during an incident is worse than losing old ones,
-# and journald_system_max_use already bounds the disk cost of being generous.
-#
-# 100000/30s ≈ 3,300/sec: ~180x measured idle. Deliberately finite rather than
-# 0 (unlimited) so a pathological log loop still cannot saturate disk I/O.
 journald_rate_limit_interval: "30s"
 journald_rate_limit_burst: 100000
-
-# Volatile (RAM) journal cap. Default is 10% of RAM — 800 MB on the 8 GB machine
-# this runbook specifies, which is a lot to lose to logs if /var/log/journal is
-# ever unavailable.
 journald_runtime_max_use: "100M"
 
-# NOTE on what is deliberately NOT set here:
-#   Compress, SyncIntervalSec  — already the defaults. Restating a default adds
-#                                a value that can drift out of sync with systemd.
-#   MaxRetentionSec            — size binds first under load, and at idle an age
-#                                cap would discard logs we could keep for free.
-#   MaxFileSec                 — SystemMaxFileSize is enough; one rotation
-#                                trigger is easier to reason about than two.
-
-# The drop-in filename lives in group_vars/all/main.yml — verify reads it too.
+# Asserted after the restart, and again by verify.yml: each of these must be the
+# EFFECTIVE value once systemd has merged every journald.conf.d drop-in.
+journald_directives:
+  Storage: "persistent"
+  SystemMaxFileSize: "{{ journald_max_file_size }}"
+  RuntimeMaxUse: "{{ journald_runtime_max_use }}"
+  RateLimitIntervalSec: "{{ journald_rate_limit_interval }}"
+  RateLimitBurst: "{{ journald_rate_limit_burst | string }}"
+  ForwardToWall: "no"

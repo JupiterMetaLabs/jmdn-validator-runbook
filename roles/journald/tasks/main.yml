@@ -1,11 +1,14 @@
 ---
 # ==============================================================================
-# journald — bound the journal, and stop it discarding logs under load.
+# journald — stop it discarding logs under load.
 #
 # Runs as part of observability.yml so the operator types nothing extra. It is in
 # scope for this kit for a concrete reason: this kit forwards the node's logs, and
 # a journald rate limit silently truncating them makes both the forwarded copy and
 # the local copy incomplete at the same moment.
+#
+# Every tunable lives in group_vars/all/main.yml, not here — verify.yml asserts
+# the same contract and has to read the same values. See journald_directives.
 # ==============================================================================
 
 - name: "journald | Ensure the drop-in directory exists"
@@ -26,8 +29,8 @@
   # No validate= here on purpose. systemd ships no validator for journald.conf —
   # `systemd-analyze verify` handles units, and `cat-config` only reads known
   # prefixes, so it cannot inspect Ansible's temp file. A validate= that cannot
-  # fail is worse than none: it reads like a safety net and is not one. The
-  # read-back below, after the restart, is the real check.
+  # fail is worse than none: it reads like a safety net and is not one. The two
+  # checks below, after the restart, are the real ones.
   notify: "journald config changed"
 
 # Apply the restart NOW rather than at end of play, so the checks below describe
@@ -35,28 +38,102 @@
 - name: "journald | Apply the configuration before verifying it"
   ansible.builtin.meta: flush_handlers
 
-# What this proves and what it does not: `cat-config` merges the files ON DISK, so
-# this confirms the drop-in is in the right directory under the right name and
-# will be picked up. Combined with the flush above it also means journald has
-# restarted since the write. It does NOT read journald's in-memory values —
-# systemd exposes no interface for that — so the runtime effect is inferred from
-# the restart, not measured.
-- name: "journald | Read back the effective configuration"
-  ansible.builtin.command: systemd-analyze cat-config systemd/journald.conf
-  register: _jd_effective
+# ------------------------------------------------------------------------------
+# Check 1 — did journald ACCEPT every line?
+#
+# journald parses its config at startup, reports a bad directive on its own
+# stderr, then carries on with the rest of the file. Nothing else surfaces that:
+# the file is present and correct on disk, cat-config shows the line, the service
+# is active — and the value never took effect. Exactly how SystemKeepFree=15%
+# shipped: a real key name with a value the parser rejects.
+#
+# Filtering on journald's CURRENT MainPID rather than a time window means a stale
+# error from an earlier restart in the same boot cannot cause a false failure,
+# and a corrected config cannot inherit the previous run's complaint.
+# ------------------------------------------------------------------------------
+- name: "journald | Read journald's own startup messages"
+  ansible.builtin.shell: |
+    pid="$(systemctl show -p MainPID --value systemd-journald)"
+    journalctl -b _PID="${pid}" --no-pager 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: _jd_own
   changed_when: false
-  failed_when: false
   check_mode: false
+  # journald logs "Journal started" within milliseconds of the restart, but the
+  # entry has to be written and indexed before it can be read back. Retrying
+  # until it appears is what stops the assertion below running against an empty
+  # string and passing vacuously.
+  #
+  # NO failed_when HERE, deliberately. `failed_when: false` overrides retry
+  # exhaustion — verified: the task reports ok after the last attempt and the play
+  # continues, so a journal we could never read would look like a journal with no
+  # errors in it. Without it, exhausting the retries is a hard failure, which is
+  # the correct outcome: we cannot confirm the config was accepted.
+  # `|| true` keeps rc at 0 so only the until condition decides.
+  retries: 5
+  delay: 2
+  until: "'Journal started' in (_jd_own.stdout | default(''))"
 
-- name: "journald | The drop-in is part of the effective config"
+- name: "journald | journald accepted every directive we wrote"
   ansible.builtin.assert:
     that:
-      - journald_dropin_name in (_jd_effective.stdout | default(''))
+      - "'Failed to parse' not in (_jd_own.stdout | default(''))"
+      - "'Unknown key name' not in (_jd_own.stdout | default(''))"
     fail_msg: >-
-      /etc/systemd/journald.conf.d/{{ journald_dropin_name }} is not in journald's effective
-      configuration. Check: systemd-analyze cat-config systemd/journald.conf
+      journald REJECTED a directive in
+      /etc/systemd/journald.conf.d/{{ journald_dropin_name }} and silently ignored
+      it, so the file looks correct on disk while the value is not in effect.
+      journald said:
+      {{ (_jd_own.stdout_lines | default([]))
+         | select('search', 'Failed to parse|Unknown key name')
+         | list | join(' / ') }}
     quiet: true
-  when: _jd_effective.rc | default(1) == 0
+
+# ------------------------------------------------------------------------------
+# Check 2 — is our value the one that WON?
+#
+# systemd merges every journald.conf.d drop-in in lexical filename order, last
+# assignment per key winning. Asserting our file appears in cat-config proves only
+# that it was read — which is why the previous version of this check passed on a
+# node where jmdn-limits.conf had already overridden SystemMaxUse. Resolve the
+# merge the way systemd does, then compare.
+# ------------------------------------------------------------------------------
+
+# No pipefail and no failed_when: if systemd-analyze fails or matches nothing,
+# stdout is empty and the assertion below fails naming the directive it could not
+# find — a clearer outcome than a bare non-zero return code, and impossible to
+# skip. A `when: rc == 0` gate here would turn an unreadable config into a pass.
+- name: "journald | Resolve the effective value of every directive"
+  ansible.builtin.shell: |
+    systemd-analyze cat-config systemd/journald.conf \
+      | grep -E '^[A-Za-z][A-Za-z0-9]*=' \
+      | awk '{ k = substr($0, 1, index($0, "=") - 1)
+               v = substr($0, index($0, "=") + 1)
+               m[k] = v }
+             END { for (k in m) print k "=" m[k] }'
+  args:
+    executable: /bin/bash
+  register: _jd_eff
+  changed_when: false
+  check_mode: false
+
+- name: "journald | Our directives are the effective ones"
+  ansible.builtin.assert:
+    that:
+      - (item.key ~ '=' ~ item.value) in (_jd_eff.stdout_lines | default([]))
+    fail_msg: >-
+      {{ item.key }} is not in effect as "{{ item.value }}". Either a drop-in
+      sorting after {{ journald_dropin_name }} overrides it, or journald rejected
+      the value. Effective now:
+      {{ (_jd_eff.stdout_lines | default([])) | select('match', item.key ~ '=')
+         | list | join(', ') | default('unset', true) }}.
+      Compare the merge order with:
+      systemd-analyze cat-config systemd/journald.conf
+    quiet: true
+  loop: "{{ journald_directives | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
 
 - name: "journald | Report current journal usage"
   ansible.builtin.command: journalctl --disk-usage
@@ -65,10 +142,18 @@
   failed_when: false
   check_mode: false
 
+# Reports the cap actually in force rather than one this role sets, because it no
+# longer sets one — jmdn-limits.conf does. Printing our own number while journald
+# enforced a different one is precisely the mistake being corrected here.
 - name: "journald | Journal usage"
   ansible.builtin.debug:
     msg: >-
       {{ _jd_usage.stdout | default('unknown') }}
-      (capped at {{ journald_system_max_use }};
-      rate limit {{ journald_rate_limit_burst }}/{{ journald_rate_limit_interval }})
+      Size cap in force:
+      {{ (_jd_eff.stdout_lines | default([])) | select('match', 'SystemMaxUse=')
+         | list | join(',') | replace('SystemMaxUse=', '')
+         | default('systemd default', true) }}
+      (set by jmdn's own installer, not by this kit).
+      Rate limit: {{ journald_rate_limit_burst }}/{{ journald_rate_limit_interval }},
+      up from the 10000/30s default that discards messages.
   when: _jd_usage.rc | default(1) == 0

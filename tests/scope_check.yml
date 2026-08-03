@@ -22,6 +22,13 @@
         that:
           - jmdn_config_path is defined
           - journald_dropin_name is defined
+          # verify.yml asserts the effective journald config against this map and
+          # names the rate limit in its failure text. Both are consumed with no
+          # journald role in the play, so both must live in group_vars.
+          - journald_directives is defined
+          - journald_directives | length > 0
+          - journald_rate_limit_burst is defined
+          - journald_rate_limit_interval is defined
           - jmdn_health_interval_seconds is defined
           - node_exporter_listen_address is defined
           - otel_agent_self_metrics_address is defined

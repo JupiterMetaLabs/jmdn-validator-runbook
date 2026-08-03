@@ -424,31 +424,81 @@
   when: _v_live_exposed is defined
 
 # ------------------------------------------------------------------------------
-# 4d. journald is still bounded and still not dropping messages
+# 4d. journald is still not dropping messages
 #
-# A distro upgrade replacing journald.conf, or someone removing the drop-in, both
-# revert this silently. The rate limit is the part worth asserting: exceeded, it
+# A distro upgrade replacing journald.conf, someone removing the drop-in, or a
+# NEW drop-in landing with a filename that sorts after ours all revert this
+# silently. The rate limit is the part worth asserting: exceeded, journald
 # DISCARDS log lines, and the only evidence is a "Suppressed N messages" entry.
+#
+# This resolves the merge the way systemd does — every journald.conf.d drop-in in
+# lexical filename order, last assignment per key winning — and compares the
+# WINNING value. An earlier version asserted only that our filename appeared in
+# cat-config, and passed on a node where jmdn's own jmdn-limits.conf had
+# overridden the value we set. Presence is not effect.
 # ------------------------------------------------------------------------------
-- name: "verify | Read journald's effective configuration"
-  ansible.builtin.command: systemd-analyze cat-config systemd/journald.conf
+# No failed_when and no rc gate on the assert that follows: if this cannot be
+# read, the setting cannot be confirmed, and an unconfirmable setting must not
+# report as verified. Empty stdout makes the assertion fail naming the directive,
+# which is a clearer failure than a bare non-zero return code.
+- name: "verify | Resolve journald's effective configuration"
+  ansible.builtin.shell: |
+    systemd-analyze cat-config systemd/journald.conf \
+      | grep -E '^[A-Za-z][A-Za-z0-9]*=' \
+      | awk '{ k = substr($0, 1, index($0, "=") - 1)
+               v = substr($0, index($0, "=") + 1)
+               m[k] = v }
+             END { for (k in m) print k "=" m[k] }'
+  args:
+    executable: /bin/bash
   register: _v_jd
   changed_when: false
-  failed_when: false
   check_mode: false
 
-- name: "verify | journald retention is still configured"
+- name: "verify | journald settings are still the effective ones"
   ansible.builtin.assert:
     that:
-      - journald_dropin_name in (_v_jd.stdout | default(''))
+      - (item.key ~ '=' ~ item.value) in (_v_jd.stdout_lines | default([]))
     fail_msg: >-
-      journald's retention drop-in is missing from the effective configuration.
-      The journal has reverted to distro defaults, which means it discards
-      messages beyond 10000 per 30s per service — so logs get silently truncated
-      during exactly the bursts you would want to read. Re-run observability.yml.
-      Check: systemd-analyze cat-config systemd/journald.conf
+      journald {{ item.key }} is no longer in effect as "{{ item.value }}"
+      — effective now:
+      {{ (_v_jd.stdout_lines | default([])) | select('match', item.key ~ '=')
+         | list | join(', ') | default('unset', true) }}.
+      If this is RateLimitBurst, journald is back to discarding messages beyond
+      10000 per 30s per service, so logs are silently truncated during exactly the
+      bursts you would want to read. Either the drop-in was removed, or a drop-in
+      whose filename sorts after {{ journald_dropin_name }} now overrides it.
+      Re-run observability.yml, then compare the merge order with:
+      systemd-analyze cat-config systemd/journald.conf
     quiet: true
-  when: _v_jd.rc | default(1) == 0
+  loop: "{{ journald_directives | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+# journald reports a rejected directive only on its own stderr at startup, and
+# then ignores that one line. Catch it here too: verify.yml is the playbook an
+# operator re-runs after editing anything, and a hand-edited drop-in with a bad
+# value is otherwise invisible.
+- name: "verify | Read journald's own startup messages"
+  ansible.builtin.shell: |
+    set -o pipefail
+    pid="$(systemctl show -p MainPID --value systemd-journald)"
+    journalctl -b _PID="${pid}" --no-pager 2>/dev/null | grep -iE 'Failed to parse|Unknown key name' || true
+  args:
+    executable: /bin/bash
+  register: _v_jd_parse
+  changed_when: false
+  check_mode: false
+
+- name: "verify | journald rejected a configuration directive"
+  ansible.builtin.assert:
+    that:
+      - (_v_jd_parse.stdout | default('') | trim) | length == 0
+    fail_msg: >-
+      journald rejected a directive and silently ignored it, so a setting that
+      looks correct on disk is not in effect. journald said:
+      {{ _v_jd_parse.stdout | default('') | trim }}
+    quiet: true
 
 - name: "verify | Report any suppressed log messages"
   ansible.builtin.command: journalctl --since '24 hours ago' --grep 'Suppressed [0-9]+ messages'
