@@ -1,0 +1,5 @@
+# The operator's filled-in config — contains their telemetry token.
+operator.yml
+inventory.remote.ini
+*.retry
+.vault_pass

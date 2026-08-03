@@ -1,0 +1,259 @@
+---
+# ==============================================================================
+# preflight — assert, never mutate.
+#
+# Every task here is read-only and safe under --check. The point is to fail in
+# the first 10 seconds with an actionable message instead of failing halfway
+# through an install on hardware we have never seen.
+# ==============================================================================
+
+- name: "preflight | Operator ID is filled in"
+  ansible.builtin.assert:
+    that:
+      - operator_id is defined
+      - operator_id | length > 0
+      - not (operator_id is match('CHANGE_ME'))
+    fail_msg: >-
+      operator_id is unset or still a placeholder in operator.yml. Use the
+      operator ID Jupiter Meta issued you — the same identity your telemetry
+      token was issued against.
+      (node_id is validated by the identity role, which also resolves
+      node_id: "auto" from node.alias in /etc/jmdn/jmdn.yaml.)
+    quiet: true
+
+# Evaluated behind no_log so the token can never reach a log, then asserted on
+# the derived boolean. Putting no_log on the assert itself would censor the
+# fail_msg too, leaving the operator with "output has been hidden".
+- name: "preflight | Evaluate telemetry token"
+  ansible.builtin.set_fact:
+    _pf_token_ok: >-
+      {{ (telemetry.token is defined)
+         and (telemetry.token | length >= 16)
+         and (not (telemetry.token is match('CHANGE_ME'))) }}
+  no_log: true
+  when: telemetry.enabled | default(true) | bool
+
+- name: "preflight | Telemetry token is filled in"
+  ansible.builtin.assert:
+    that:
+      - _pf_token_ok | bool
+    fail_msg: >-
+      telemetry.token is unset, too short, or still a placeholder. Request one
+      from Jupiter Meta, or set telemetry.enabled=false to install the local
+      exporters without pushing anything.
+    quiet: true
+  when: telemetry.enabled | default(true) | bool
+
+- name: "preflight | Network profile resolved"
+  ansible.builtin.assert:
+    that:
+      - network_profile is defined
+      - network_profile.chain_id | int > 0
+    fail_msg: >-
+      profiles/{{ network | default('mainnet') }}.yml is missing or has no
+      chain_id. Supported today: mainnet.
+    quiet: true
+
+- name: "preflight | Supported OS and init system"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['service_mgr'] == 'systemd'
+      - ansible_facts['os_family'] in ['Debian', 'RedHat']
+    fail_msg: >-
+      Supported for v1: systemd-based Linux (Debian/Ubuntu, RHEL family).
+      Detected: {{ ansible_facts['os_family'] | default('unknown') }} /
+      {{ ansible_facts['service_mgr'] | default('unknown') }}.
+    quiet: true
+
+- name: "preflight | Supported CPU architecture"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+    fail_msg: >-
+      Supported: x86_64, aarch64. Detected {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: "preflight | Measure free space on /"
+  ansible.builtin.set_fact:
+    _pf_root_free: >-
+      {{ (ansible_facts['mounts'] | default([])
+          | selectattr('mount', 'equalto', '/')
+          | map(attribute='size_available') | first | default(0)) | int }}
+
+- name: "preflight | Root filesystem has headroom"
+  ansible.builtin.assert:
+    that:
+      - _pf_root_free | int > (2 * 1024 * 1024 * 1024)
+    fail_msg: >-
+      Only {{ (_pf_root_free | int / 1024 / 1024) | round | int }} MB free on /
+      (2 GB minimum). The telemetry layer needs ~400 MB plus queue headroom, and
+      a full root filesystem will stop the node itself. If this reads 0, mount
+      facts could not be gathered — check manually with `df -h /`.
+    quiet: true
+
+# The 2 GB gate above is the TELEMETRY requirement. Installing a node is a
+# different order of magnitude: the chain snapshot is ~16 GiB compressed, and
+# bootstrap_sync.sh holds the downloaded parts and the extracted data under /opt
+# at the same time, peaking at 40-60 GB.
+#
+# Warn rather than fail: operators who already run jmdn — and therefore skip the
+# snapshot — legitimately have far less free space, and failing them would be
+# wrong. Passing the 2 GB gate alone gives false comfort about the single step
+# most likely to run out of room.
+- name: "preflight | Measure free space on the filesystem holding /opt"
+  ansible.builtin.set_fact:
+    _pf_opt_free: >-
+      {{ (ansible_facts['mounts'] | default([])
+          | selectattr('mount', 'in', ['/opt', '/'])
+          | sort(attribute='mount', reverse=true)
+          | map(attribute='size_available') | first | default(0)) | int }}
+    _pf_opt_mount: >-
+      {{ (ansible_facts['mounts'] | default([])
+          | selectattr('mount', 'in', ['/opt', '/'])
+          | sort(attribute='mount', reverse=true)
+          | map(attribute='mount') | first | default('/')) }}
+
+- name: "preflight | Warn if there is no room for a snapshot bootstrap"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ (_pf_opt_free | int / 1024 / 1024 / 1024) | round(1) }} GB free
+      on {{ _pf_opt_mount }}, which holds /opt. A chain-snapshot bootstrap
+      (Stage 1.7) peaks at 40-60 GB and aborts part-way through if it runs out.
+      Either grow the disk before starting Stage 1, or skip the snapshot and
+      leave fastsync.catch_up_from_block at 0 to sync from genesis instead —
+      much slower, but it needs almost no disk. Ignore this if jmdn is already
+      installed on this machine.
+  when: (_pf_opt_free | int) < (60 * 1024 * 1024 * 1024)
+
+# Clock accuracy is not cosmetic here: consensus is timing-sensitive and
+# skewed clocks silently corrupt both trace correlation and any rate() we
+# compute over your metrics.
+# `command -v` is a shell builtin, so ansible.builtin.command cannot run it —
+# doing so reports every tool as missing. shell is correct here, and the probe
+# is read-only.
+- name: "preflight | Probe for base tools"
+  ansible.builtin.shell: "command -v {{ item }}"
+  register: _pf_tools
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: [tar, curl, gzip]
+
+- name: "preflight | Required base tools are present"
+  ansible.builtin.assert:
+    that:
+      - _pf_tools.results | selectattr('rc', 'ne', 0) | list | length == 0
+    fail_msg: >-
+      Missing base tools:
+      {{ _pf_tools.results | selectattr('rc', 'ne', 0) | map(attribute='item') | join(', ') }}.
+      `tar` is required by Ansible's unarchive module for both binary installs;
+      `curl` is required by the health collector. Install them and re-run.
+    quiet: true
+
+- name: "preflight | Outbound reachability of the binary sources"
+  # The two binaries come from GitHub releases (redirected to
+  # objects.githubusercontent.com). This was previously unchecked, so a blocked
+  # egress surfaced as a mid-install failure instead of a preflight refusal.
+  ansible.builtin.uri:
+    url: "{{ item }}"
+    method: GET
+    timeout: 15
+    status_code: [200, 301, 302, 401, 403, 404]
+  register: _pf_egress
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  loop:
+    - "https://github.com"
+    - "https://objects.githubusercontent.com"
+
+- name: "preflight | Fail clearly if the binary sources are unreachable"
+  ansible.builtin.assert:
+    that:
+      - _pf_egress.results | selectattr('status', 'defined')
+        | selectattr('status', 'gt', 0) | list | length == 2
+    fail_msg: >-
+      Cannot reach GitHub release hosting outbound on TCP 443. node_exporter and
+      the OTel agent are downloaded from
+      github.com/{prometheus,open-telemetry} and served from
+      objects.githubusercontent.com. Allow outbound 443 to both, or pre-stage the
+      binaries and set node_exporter_install_path / otel_agent_install_path.
+    quiet: true
+
+- name: "preflight | Read NTP synchronisation state"
+  ansible.builtin.command: timedatectl show --property=NTPSynchronized --value
+  register: pf_ntp
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "preflight | Warn if the clock is not NTP-synchronised"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: NTPSynchronized={{ pf_ntp.stdout | default('unknown') | trim }}.
+      Install and enable chrony (or systemd-timesyncd) before going live.
+      Continuing, because a node with a bad clock is still worth observing.
+  when: (pf_ntp.stdout | default('') | trim) != 'yes'
+
+- name: "preflight | Ingest gateway is reachable outbound"
+  ansible.builtin.uri:
+    url: "{{ telemetry.endpoint | default('https://otel.jmdt.io') }}/health"
+    method: GET
+    timeout: 10
+    status_code: [200, 401, 403, 404]
+    validate_certs: true
+  register: pf_gw
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: telemetry.enabled | default(true) | bool
+
+- name: "preflight | Fail clearly if the gateway is unreachable"
+  ansible.builtin.assert:
+    that:
+      - pf_gw.status is defined
+      - pf_gw.status > 0
+    fail_msg: >-
+      Cannot reach {{ telemetry.endpoint | default('https://otel.jmdt.io') }}
+      outbound on TCP 443 ({{ pf_gw.msg | default('no response') }}).
+      Telemetry is push-only over one outbound HTTPS connection — no inbound
+      port is needed — but that connection must be allowed to leave.
+    quiet: true
+  when: telemetry.enabled | default(true) | bool
+
+# jmdn does not serve app metrics unless ports.metrics is set in jmdn.yaml.
+# Scraping a dead target would leave a permanently-red job in our dashboards,
+# so surface it here rather than shipping the noise.
+- name: "preflight | Probe jmdn app metrics endpoint if configured"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ jmdn_endpoints.metrics_port }}/metrics"
+    method: GET
+    timeout: 5
+    status_code: [200]
+  register: _pf_appmetrics
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: (jmdn_endpoints.metrics_port | default(0) | int) > 0
+
+- name: "preflight | Warn if app metrics are unreachable"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: jmdn_endpoints.metrics_port={{ jmdn_endpoints.metrics_port }} is
+      set but nothing is serving /metrics there. Either set
+      "ports.metrics: {{ jmdn_endpoints.metrics_port }}" and
+      "binds.metrics: 127.0.0.1" in /etc/jmdn/jmdn.yaml and restart jmdn, or set
+      metrics_port: 0 in operator.yml. Left as-is, the app scrape target reports
+      as permanently down.
+  when:
+    - (jmdn_endpoints.metrics_port | default(0) | int) > 0
+    - _pf_appmetrics.status is defined
+    - _pf_appmetrics.status != 200
+
+- name: "preflight | Summary"
+  ansible.builtin.debug:
+    msg: >-
+      preflight OK — {{ jmdn_node_id | default(node_id) }} ({{ operator_id }}) on
+      {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+      / {{ ansible_facts['architecture'] }}, chain {{ network_profile.chain_id }}

@@ -1,0 +1,32 @@
+---
+# ==============================================================================
+# preflight.yml — read-only machine check. Mutates nothing, needs no privilege.
+#
+# Run this BEFORE observability.yml to confirm the machine and network can
+# support the install:
+#
+#   ansible-playbook preflight.yml
+#
+# Checks: operator identity and token are filled in; network profile resolves;
+# supported OS/init/arch; free space on /; base tools (tar, curl, gzip); NTP
+# synchronisation; outbound reachability of GitHub release hosting and the
+# telemetry gateway; and whether jmdn app metrics are actually being served if
+# you configured a port for them.
+#
+# Safe to run at any time. Every task is read-only.
+# ==============================================================================
+- name: "JMDN operator node — preflight only (read-only)"
+  hosts: operator_node
+  become: false
+  gather_facts: true
+  vars_files:
+    - operator.yml
+    - "profiles/{{ network | default('mainnet') }}.yml"
+  roles:
+    # identity_required=false: operator.yml is filled in Stage 0.5, before jmdn
+    # is installed, so node_id: "auto" has nothing to derive from yet. Report it,
+    # do not fail on it — observability.yml and verify.yml assert properly.
+    - role: identity
+      identity_required: false
+
+    - role: preflight

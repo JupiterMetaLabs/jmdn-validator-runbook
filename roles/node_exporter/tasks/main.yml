@@ -1,0 +1,238 @@
+---
+# ==============================================================================
+# node_exporter — version-aware install, whitelisted collectors, hardened unit.
+#
+# IDEMPOTENCY: the download/install block runs only when the installed version
+#   differs from node_exporter_version. Re-runs are no-ops.
+# SAFETY:      release checksums are fetched from the release itself and
+#   verified before the binary is installed; flags are probed against the real
+#   binary before the unit file is written; temp files are removed in `always`.
+# ==============================================================================
+
+- name: "node_exporter | Map architecture to release suffix"
+  ansible.builtin.set_fact:
+    _ne_arch: >-
+      {{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}
+
+- name: "node_exporter | Compute release artifact names"
+  ansible.builtin.set_fact:
+    _ne_release: "node_exporter-{{ node_exporter_version }}.linux-{{ _ne_arch }}"
+    _ne_base_url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}"
+
+- name: "node_exporter | Create system group"
+  ansible.builtin.group:
+    name: "{{ node_exporter_group }}"
+    system: true
+    state: present
+
+- name: "node_exporter | Create system user"
+  ansible.builtin.user:
+    name: "{{ node_exporter_user }}"
+    group: "{{ node_exporter_group }}"
+    system: true
+    shell: "{{ jmdn_nologin_shell | default('/usr/sbin/nologin') }}"
+    create_home: false
+    state: present
+
+# Created here (not in the health role) because node_exporter's textfile
+# collector reports a scrape error if the directory is missing, and this role
+# starts the service. Ownership is deliberately NOT set here: the writer user
+# does not exist until the health role runs, and `file` fails outright on an
+# unknown owner — which, with failed_when:false, would silently skip creating
+# the directory at all. The health role sets owner/group/mode immediately after.
+- name: "node_exporter | Textfile collector directory"
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+# ------------------------------------------------------------------------------
+# Version detection
+# ------------------------------------------------------------------------------
+- name: "node_exporter | Stat existing binary"
+  ansible.builtin.stat:
+    path: "{{ node_exporter_install_path }}"
+  register: _ne_bin
+
+- name: "node_exporter | Read installed version"
+  ansible.builtin.command: "{{ node_exporter_install_path }} --version"
+  register: _ne_ver_out
+  changed_when: false
+  failed_when: false
+  check_mode: false          # read-only probe; must run so --check is truthful
+  when: _ne_bin.stat.exists
+
+- name: "node_exporter | Parse installed version"
+  ansible.builtin.set_fact:
+    # kingpin writes version info to stderr on some releases, stdout on others.
+    _ne_installed: >-
+      {{ ((_ne_ver_out.stdout | default('')) ~ ' ' ~ (_ne_ver_out.stderr | default('')))
+         | regex_search('version ([0-9]+\.[0-9]+\.[0-9]+)', '\1')
+         | default([], true) | first | default('') }}
+
+- name: "node_exporter | Decide whether install is needed"
+  ansible.builtin.set_fact:
+    _ne_install: "{{ (not _ne_bin.stat.exists) or (_ne_installed != node_exporter_version) }}"
+
+# ------------------------------------------------------------------------------
+# Install — checksum-verified, guaranteed cleanup
+# ------------------------------------------------------------------------------
+# Ansible's check mode cannot simulate a download: get_url reports "would
+# change" without writing the file, so unarchive would then fail with "Source
+# does not exist". Skipping the block under --check keeps a dry run honest
+# instead of aborting on a healthy host.
+- name: "node_exporter | (check mode) Report what would be installed"
+  ansible.builtin.debug:
+    msg: >-
+      Would install node_exporter {{ node_exporter_version }} (installed:
+      {{ _ne_installed if (_ne_installed | length > 0) else 'absent' }}).
+      Download and extraction are skipped under --check.
+  when:
+    - _ne_install | bool
+    - ansible_check_mode
+
+- name: "node_exporter | Install v{{ node_exporter_version }}"
+  when:
+    - _ne_install | bool
+    - not ansible_check_mode
+  block:
+    - name: "node_exporter | Fetch official SHA256SUMS for the release"
+      ansible.builtin.uri:
+        url: "{{ _ne_base_url }}/sha256sums.txt"
+        return_content: true
+        timeout: 30
+      register: _ne_sums
+      check_mode: false
+
+    - name: "node_exporter | Extract the digest for our artifact"
+      ansible.builtin.set_fact:
+        _ne_sha256: >-
+          {{ (_ne_sums.content.splitlines()
+              | select('search', '\s' ~ ((_ne_release ~ '.tar.gz') | regex_escape) ~ '$')
+              | first).split()[0] }}
+
+    - name: "node_exporter | Verify a digest was actually found"
+      ansible.builtin.assert:
+        that:
+          - _ne_sha256 is defined
+          - _ne_sha256 | length == 64
+        fail_msg: >-
+          No SHA256 found for {{ _ne_release }}.tar.gz in the release checksums.
+          Refusing to install an unverified binary. Check that
+          node_exporter_version={{ node_exporter_version }} publishes a
+          linux-{{ _ne_arch }} artifact.
+        quiet: true
+
+    - name: "node_exporter | Create staging directory"
+      ansible.builtin.file:
+        path: "/tmp/{{ _ne_release }}.stage"
+        state: directory
+        mode: '0700'
+
+    - name: "node_exporter | Download release tarball (checksum enforced)"
+      ansible.builtin.get_url:
+        url: "{{ _ne_base_url }}/{{ _ne_release }}.tar.gz"
+        dest: "/tmp/{{ _ne_release }}.stage/{{ _ne_release }}.tar.gz"
+        checksum: "sha256:{{ _ne_sha256 }}"
+        mode: '0600'
+        timeout: 60
+
+    - name: "node_exporter | Extract"
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ _ne_release }}.stage/{{ _ne_release }}.tar.gz"
+        dest: "/tmp/{{ _ne_release }}.stage"
+        remote_src: true
+
+    - name: "node_exporter | Install binary"
+      ansible.builtin.copy:
+        src: "/tmp/{{ _ne_release }}.stage/{{ _ne_release }}/node_exporter"
+        dest: "{{ node_exporter_install_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+        remote_src: true
+      notify: Restart node_exporter
+
+  always:
+    - name: "node_exporter | Remove staging directory"
+      ansible.builtin.file:
+        path: "/tmp/{{ _ne_release }}.stage"
+        state: absent
+
+# ------------------------------------------------------------------------------
+# Flag validation BEFORE the unit is written
+#
+# A wrong or version-removed flag otherwise surfaces as a service that will not
+# start, discovered minutes later. kingpin rejects unknown flags on parse,
+# before binding, so a short timed run is a safe syntax check: rc 124 (timed
+# out while serving) means the flags parsed.
+# ------------------------------------------------------------------------------
+- name: "node_exporter | Probe the flag set against the real binary"
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '3', node_exporter_install_path,
+               '--web.listen-address=127.0.0.1:19100'] + _ne_args_probe }}"
+  vars:
+    _ne_args_probe: >-
+      {{ ['--collector.disable-defaults']
+         + (node_exporter_collectors_enabled | map('regex_replace', '^', '--collector.') | list)
+         + node_exporter_systemd_extra_args }}
+  register: _ne_probe
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    ('unknown long flag' in (_ne_probe.stderr | default('')))
+    or ('unknown flag' in (_ne_probe.stderr | default('')))
+    or ('unexpected' in (_ne_probe.stderr | default('')))
+  when: not ansible_check_mode
+
+- name: "node_exporter | Install systemd unit"
+  ansible.builtin.template:
+    src: node_exporter.service.j2
+    dest: /etc/systemd/system/node_exporter.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart node_exporter
+
+- name: "node_exporter | Enable and start"
+  ansible.builtin.systemd:
+    name: node_exporter
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: "node_exporter | Apply pending restart before self-check"
+  ansible.builtin.meta: flush_handlers
+
+# ------------------------------------------------------------------------------
+# Self-check: the systemd collector is the one collector that can silently fail
+# under a hardened unit (it needs AF_UNIX for D-Bus, and /run access). Catch it
+# here rather than discovering months later that JMDNServiceDown never fires.
+# ------------------------------------------------------------------------------
+- name: "node_exporter | Scrape self and confirm systemd metrics are present"
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_address }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _ne_self
+  retries: 5
+  delay: 3
+  until: _ne_self.status is defined and _ne_self.status == 200
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: "node_exporter | Assert node_systemd_unit_state is exposed"
+  ansible.builtin.assert:
+    that:
+      - "'node_systemd_unit_state' in _ne_self.content"
+    fail_msg: >-
+      node_exporter is running but exposes no node_systemd_unit_state metrics.
+      The systemd collector needs AF_UNIX in RestrictAddressFamilies and read
+      access to the D-Bus socket. Check:
+        journalctl -u node_exporter -n 50
+      Without this metric, "is jmdn.service running" cannot be monitored.
+    quiet: true
+  when: not ansible_check_mode

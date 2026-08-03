@@ -1,0 +1,178 @@
+# =============================================================================
+# OpenTelemetry Collector — JMDN operator node agent
+# Managed by jmdn-validator-runbook. Local edits will be overwritten.
+#
+# Everything here reads from loopback. The only outbound destination is the
+# otlphttp exporter below.
+# =============================================================================
+
+extensions:
+  # Disk-backed export queue: telemetry survives a network outage, a gateway
+  # restart, and a reboot of this machine, instead of being dropped.
+  file_storage/queue:
+    directory: {{ otel_agent_queue_dir }}
+    timeout: 10s
+    compaction:
+      on_start: true
+      directory: {{ otel_agent_queue_dir }}
+      max_transaction_size: 65536
+
+receivers:
+  # ---------------------------------------------------------------------------
+  # Local scrapes.
+  #
+  # WHY the prometheus receiver rather than hostmetrics: Jupiter Meta's
+  # dashboards and alert rules are written against node_exporter metric names
+  # (node_cpu_seconds_total, node_memory_MemAvailable_bytes, node_load1,
+  # node_systemd_unit_state) keyed on a `server` label. Scraping node_exporter
+  # keeps every node on the network described in one metric vocabulary;
+  # hostmetrics would emit system_* names and fork it.
+  #
+  # It also synthesises `up` per target, which is what lets an operator node
+  # appear in dashboards that template on label_values(up, job).
+  # ---------------------------------------------------------------------------
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: {{ jmdn_job_host }}
+          scrape_interval: {{ telemetry.scrape_interval | default(30) }}s
+          scrape_timeout: {{ [(telemetry.scrape_interval | default(30) | int - 5), 10] | max }}s
+          static_configs:
+            - targets: ['{{ node_exporter_listen_address | default("127.0.0.1:9100") }}']
+              labels:
+                server: '{{ jmdn_identity.server }}'
+                operator_id: '{{ jmdn_identity.operator_id }}'
+                node_role: '{{ jmdn_identity.node_role }}'
+                chain_id: '{{ jmdn_identity.chain_id }}'
+{% if (jmdn_endpoints.metrics_port | default(0) | int) > 0 %}
+
+        # jmdn's own application metrics: p2p peer counts, heartbeat latency,
+        # ImmuDB connection pools, goroutine accounting.
+        - job_name: {{ jmdn_job_app }}
+          scrape_interval: {{ telemetry.scrape_interval | default(30) }}s
+          scrape_timeout: {{ [(telemetry.scrape_interval | default(30) | int - 5), 10] | max }}s
+          static_configs:
+            - targets: ['127.0.0.1:{{ jmdn_endpoints.metrics_port }}']
+              labels:
+                server: '{{ jmdn_identity.server }}'
+                operator_id: '{{ jmdn_identity.operator_id }}'
+                node_role: '{{ jmdn_identity.node_role }}'
+                chain_id: '{{ jmdn_identity.chain_id }}'
+{% endif %}
+{% if telemetry.forward_node_logs | default(true) | bool %}
+
+  # jmdn's own logs and traces, handed over on loopback so that all three
+  # signals share one credential, one egress path and one disk buffer.
+  # Set telemetry.forward_node_logs=false to have jmdn reach the gateway itself.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: {{ otel_agent_otlp_grpc }}
+      http:
+        endpoint: {{ otel_agent_otlp_http }}
+{% endif %}
+
+processors:
+  # Must be first in every pipeline: refuses new data under memory pressure so
+  # back-pressure is graceful instead of an OOM restart loop.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: {{ otel_agent_memory_limit_mib }}
+    spike_limit_mib: {{ otel_agent_memory_spike_mib }}
+
+  # ---------------------------------------------------------------------------
+  # Identity on METRIC DATAPOINTS (not resource attributes).
+  #
+  # On the hub, OTLP resource attributes become labels on a separate
+  # `target_info` series — only job/instance are promoted onto the metrics
+  # themselves. Identity carried only in the resource would therefore produce
+  # series with no `server` label, and every existing dashboard panel filters
+  # on `server`. Scrape labels above already land as datapoint attributes;
+  # this processor guarantees it regardless of receiver version.
+  # ---------------------------------------------------------------------------
+  attributes/identity:
+    actions:
+      - key: server
+        value: '{{ jmdn_identity.server }}'
+        action: upsert
+      - key: operator_id
+        value: '{{ jmdn_identity.operator_id }}'
+        action: upsert
+      - key: node_role
+        value: '{{ jmdn_identity.node_role }}'
+        action: upsert
+      - key: chain_id
+        value: '{{ jmdn_identity.chain_id }}'
+        action: upsert
+
+  # For logs and traces, resource attributes ARE the right home: Loki and
+  # Tempo index on them.
+  resource/identity:
+    attributes:
+      - key: server
+        value: '{{ jmdn_identity.server }}'
+        action: upsert
+      - key: operator_id
+        value: '{{ jmdn_identity.operator_id }}'
+        action: upsert
+      - key: node_role
+        value: '{{ jmdn_identity.node_role }}'
+        action: upsert
+      - key: chain_id
+        value: '{{ jmdn_identity.chain_id }}'
+        action: upsert
+
+  batch:
+    timeout: {{ otel_agent_batch_timeout }}
+    send_batch_size: {{ otel_agent_batch_size }}
+    send_batch_max_size: {{ otel_agent_batch_size }}
+
+exporters:
+  otlphttp/jmdt:
+    endpoint: {{ telemetry.endpoint | default('https://otel.jmdt.io') }}
+    headers:
+      # Resolved from the 0600 EnvironmentFile at start-up. Never written into
+      # this file, never visible in `ps`.
+      Authorization: "Bearer ${env:JMDT_OTEL_TOKEN}"
+    compression: gzip
+    timeout: 30s
+    tls:
+      insecure: false
+    sending_queue:
+      enabled: true
+      storage: file_storage/queue
+      num_consumers: 2
+      queue_size: {{ otel_agent_queue_size }}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 300s
+      max_elapsed_time: 3600s
+
+service:
+  extensions: [file_storage/queue]
+  telemetry:
+    logs:
+      level: {{ otel_agent_log_level }}
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: '{{ otel_agent_self_metrics_address.split(":")[0] }}'
+                port: {{ otel_agent_self_metrics_address.split(":")[1] }}
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, attributes/identity, batch]
+      exporters: [otlphttp/jmdt]
+{% if telemetry.forward_node_logs | default(true) | bool %}
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/identity, batch]
+      exporters: [otlphttp/jmdt]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/identity, batch]
+      exporters: [otlphttp/jmdt]
+{% endif %}

@@ -1,0 +1,48 @@
+---
+# ==============================================================================
+# tests/render_config.yml — offline render gate.
+#
+# Renders every template with a representative variable set and parses the
+# result. Run before and after any template or defaults change; a YAML parse
+# failure or an unexpected diff is the gate.
+#
+#   ansible-playbook tests/render_config.yml -e @tests/fixtures/operator.test.yml
+# ==============================================================================
+- name: "Render all templates offline"
+  hosts: operator_node
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../profiles/mainnet.yml"
+    - "{{ playbook_dir }}/../roles/node_exporter/defaults/main.yml"
+    - "{{ playbook_dir }}/../roles/otel_agent/defaults/main.yml"
+    - "{{ playbook_dir }}/../roles/jmdn_health_collector/defaults/main.yml"
+  vars:
+    render_dir: "/tmp/jmdn-kit-render"
+  tasks:
+    - name: "Ensure output directory"
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: "Render"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/{{ item.role }}/templates/{{ item.src }}"
+        dest: "{{ render_dir }}/{{ item.out }}"
+        mode: '0600'
+      loop:
+        - { role: otel_agent, src: otelcol.yaml.j2, out: otelcol.yaml }
+        - { role: otel_agent, src: otelcol.service.j2, out: otelcol.service }
+        - { role: otel_agent, src: otelcol.env.j2, out: otelcol.env }
+        - { role: node_exporter, src: node_exporter.service.j2, out: node_exporter.service }
+        - { role: jmdn_health_collector, src: collector.env.j2,    out: collector.env }
+        - { role: jmdn_health_collector, src: jmdn-health.service.j2, out: jmdn-health.service }
+        - { role: jmdn_health_collector, src: jmdn-health.timer.j2,   out: jmdn-health.timer }
+      loop_control:
+        label: "{{ item.out }}"
+
+    - name: "Report"
+      ansible.builtin.debug:
+        msg: "rendered into {{ render_dir }}"

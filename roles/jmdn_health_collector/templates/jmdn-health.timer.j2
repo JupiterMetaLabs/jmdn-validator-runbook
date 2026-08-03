@@ -1,0 +1,15 @@
+# Managed by jmdn-validator-runbook.
+[Unit]
+Description=Collect JMDN chain-health metrics every {{ jmdn_health_interval_seconds }}s
+Documentation=https://github.com/JupiterMetaLabs/jmdn-validator-runbook
+
+[Timer]
+# Fire shortly after boot, then every interval measured from the END of the
+# previous run — so a slow run can never overlap the next one.
+OnBootSec=30s
+OnUnitInactiveSec={{ jmdn_health_interval_seconds }}s
+AccuracySec=1s
+# No Persistent=true: a missed run while the machine was off is worthless data.
+
+[Install]
+WantedBy=timers.target

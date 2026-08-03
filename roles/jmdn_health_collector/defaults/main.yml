@@ -1,0 +1,40 @@
+---
+# ==============================================================================
+# jmdn_health_collector — chain-health metrics via the node_exporter textfile
+# collector.
+#
+# WHY a timer + textfile instead of a daemon or an OTel receiver:
+#   - jmdn's own Prometheus registry contains NO block height and NO sync
+#     signal (verified: p2p_*, main_db_*, accounts_db_*, gro_*, libp2p_* only).
+#     "Am I in sync" is therefore unanswerable from metrics today.
+#   - A 30s oneshot that curls loopback costs ~5 ms of CPU and zero resident
+#     memory between runs. A daemon would cost 30-80 MB permanently.
+#   - It works against ANY jmdn version, including releases older than a future
+#     native jmdn_block_height gauge.
+# ==============================================================================
+
+jmdn_health_user: "jmdn-health"
+jmdn_health_group: "jmdn-health"
+
+jmdn_health_script_path: "/usr/local/bin/jmdn-health-collector"
+jmdn_health_env_dir: "/etc/jmdn-health"
+jmdn_health_state_dir: "/var/lib/jmdn-health"
+
+# Must match node_exporter's --collector.textfile.directory.
+# Set centrally in group_vars/all/main.yml.
+jmdn_health_textfile_dir: "/var/lib/node_exporter/textfile"
+
+# Interval between collections. Matched to the agent's scrape interval so the
+# agent never reads the same sample twice, and never misses one.
+jmdn_health_interval_seconds: 30
+
+# Per-request ceiling. A wedged node must not make the collector hang; a hung
+# collector produces stale metrics, which is worse than absent ones.
+jmdn_health_curl_timeout: 2
+
+# Runtime dependency. jq is 1.1 MB installed and gives deterministic JSON
+# parsing; grep/sed on JSON silently yields wrong numbers, which becomes wrong
+# alerts.
+jmdn_health_packages:
+  - jq
+  - curl

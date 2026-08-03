@@ -1,0 +1,111 @@
+# ==============================================================================
+# node_exporter — managed by jmdn-validator-runbook. Local edits will be overwritten.
+#
+# Hardened beyond the upstream example in three ways that matter here:
+#   1. AF_UNIX is permitted. The systemd collector talks D-Bus over a unix
+#      socket; omitting AF_UNIX makes node_systemd_unit_state silently absent
+#      while the service still reports "active". That is the exact failure that
+#      leaves "is jmdn running" unmonitored.
+#   2. Collectors are whitelisted, not blacklisted, so an upgrade cannot switch
+#      new ones on behind your back.
+#   3. Resource caps are sized from measured RSS, so a leak here can never
+#      compete with jmdn.
+# ==============================================================================
+{% set _args = ['--web.listen-address=' ~ node_exporter_listen_address,
+                '--collector.disable-defaults'] %}
+{% for c in node_exporter_collectors_enabled %}
+{%   set _ = _args.append('--collector.' ~ c) %}
+{% endfor %}
+{% if 'systemd' in node_exporter_collectors_enabled %}
+{%   set _ = _args.append('--collector.systemd.unit-include=' ~ node_exporter_systemd_units_regex) %}
+{%   for a in node_exporter_systemd_extra_args %}
+{%     set _ = _args.append(a) %}
+{%   endfor %}
+{% endif %}
+{% if 'textfile' in node_exporter_collectors_enabled %}
+{%   set _ = _args.append('--collector.textfile.directory=' ~ node_exporter_textfile_dir) %}
+{% endif %}
+{% if 'filesystem' in node_exporter_collectors_enabled %}
+{%   set _ = _args.append('--collector.filesystem.mount-points-exclude=' ~ node_exporter_fs_mount_exclude) %}
+{%   set _ = _args.append('--collector.filesystem.fs-types-exclude=' ~ node_exporter_fs_types_exclude) %}
+{% endif %}
+{% if node_exporter_disable_exporter_metrics %}
+{%   set _ = _args.append('--web.disable-exporter-metrics') %}
+{% endif %}
+{% for a in node_exporter_extra_args %}
+{%   set _ = _args.append(a) %}
+{% endfor %}
+
+[Unit]
+Description=Prometheus Node Exporter (jmdn-validator-runbook)
+Documentation=https://github.com/prometheus/node_exporter
+After=network-online.target
+Wants=network-online.target
+
+# StartLimit* belong to [Unit]. Placed in [Service] systemd logs
+# "Unknown key name ... ignoring" and the rate limit silently does not apply —
+# verified with `systemd-analyze verify`.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User={{ node_exporter_user }}
+Group={{ node_exporter_group }}
+
+ExecStart={{ node_exporter_install_path }} \
+{{ _args | join(' \\\n') | indent(4, true) }}
+
+# --- Restart policy: bounded, so a broken config cannot become a boot loop ---
+# (the burst/interval half of this lives in [Unit] above)
+Restart=on-failure
+RestartSec=5
+
+# --- Resource caps (measured RSS with the whitelisted collectors: 15-25 MB) ---
+MemoryMax={{ node_exporter_memory_max }}
+MemoryHigh={{ node_exporter_memory_high }}
+CPUQuota={{ node_exporter_cpu_quota }}
+LimitNOFILE=8192
+TasksMax=64
+
+# --- Sandboxing ---------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=default
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# AF_UNIX is required for the systemd collector's D-Bus connection.
+# AF_NETLINK is required by the netdev/netstat collectors on modern kernels.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# ProtectSystem=strict mounts /run read-only; D-Bus needs to connect through it.
+# The '-' prefix tolerates the paths being absent.
+ReadWritePaths=-/run/dbus
+ReadWritePaths=-/run/systemd/private
+
+# ProtectControlGroups and ProtectKernelModules are deliberately NOT set:
+# several collectors read cgroup and module state.
+
+# --- Logging ------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node_exporter
+
+[Install]
+WantedBy=multi-user.target

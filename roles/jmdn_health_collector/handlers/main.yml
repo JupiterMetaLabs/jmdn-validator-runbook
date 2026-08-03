@@ -1,0 +1,11 @@
+---
+- name: Restart jmdn-health timer
+  ansible.builtin.systemd:
+    name: jmdn-health.timer
+    state: restarted
+    daemon_reload: true
+
+- name: Run jmdn-health once
+  ansible.builtin.systemd:
+    name: jmdn-health.service
+    state: started

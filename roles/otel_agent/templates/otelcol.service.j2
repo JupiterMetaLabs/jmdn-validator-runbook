@@ -1,0 +1,69 @@
+# ==============================================================================
+# OpenTelemetry Collector agent — managed by jmdn-validator-runbook.
+#
+# Caps exist so telemetry can never compete with consensus for resources. If
+# this unit misbehaves, systemd kills it; jmdn keeps producing blocks.
+# ==============================================================================
+[Unit]
+Description=OpenTelemetry Collector agent (JMDN operator node)
+Documentation=https://github.com/JupiterMetaLabs/jmdn-validator-runbook
+After=network-online.target node_exporter.service
+Wants=network-online.target
+# Deliberately NOT Requires= on jmdn: telemetry must keep flowing while the
+# node is down. That is precisely when we need to see this machine.
+
+# StartLimit* belong to [Unit]; systemd ignores them under [Service].
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User={{ otel_agent_user }}
+Group={{ otel_agent_group }}
+EnvironmentFile={{ otel_agent_config_dir }}/otelcol.env
+ExecStart={{ otel_agent_install_path }} --config={{ otel_agent_config_dir }}/config.yaml
+
+Restart=on-failure
+RestartSec=10
+
+# --- Resource caps ------------------------------------------------------------
+MemoryHigh={{ otel_agent_memory_high }}
+MemoryMax={{ otel_agent_memory_max }}
+CPUQuota={{ otel_agent_cpu_quota }}
+LimitNOFILE=16384
+TasksMax=128
+
+# --- Sandboxing ---------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Only the queue directory is writable.
+ReadWritePaths={{ otel_agent_state_dir }}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=otelcol
+
+[Install]
+WantedBy=multi-user.target

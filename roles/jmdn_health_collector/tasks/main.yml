@@ -1,0 +1,184 @@
+---
+# ==============================================================================
+# jmdn_health_collector
+#
+# IDEMPOTENCY: packages/user/dirs/templates are all declarative. A re-run with
+#   no variable change reports changed=0.
+# SAFETY:      the script is syntax-checked with `sh -n` before it is installed
+#   into place, so a template mistake cannot ship a broken collector.
+# ==============================================================================
+
+- name: "health | Install runtime dependencies"
+  ansible.builtin.package:
+    name: "{{ jmdn_health_packages }}"
+    state: present
+  register: _hc_pkg
+  until: _hc_pkg is succeeded
+  retries: 3
+  delay: 5
+
+- name: "health | Create system group"
+  ansible.builtin.group:
+    name: "{{ jmdn_health_group }}"
+    system: true
+    state: present
+
+# Supplementary membership of the node_exporter group so the collector can chgrp
+# its output to a group node_exporter can read. Files otherwise inherit the
+# WRITER's primary group (jmdn-health), which node_exporter is not a member of —
+# at mode 0640 that makes the metrics file unreadable and the textfile collector
+# silently returns nothing.
+- name: "health | Create unprivileged collector user"
+  ansible.builtin.user:
+    name: "{{ jmdn_health_user }}"
+    group: "{{ jmdn_health_group }}"
+    groups: "{{ node_exporter_group | default('node_exporter') }}"
+    append: true
+    system: true
+    shell: "{{ jmdn_nologin_shell | default('/usr/sbin/nologin') }}"
+    create_home: false
+    state: present
+
+- name: "health | State directory (JWT cache)"
+  ansible.builtin.file:
+    path: "{{ jmdn_health_state_dir }}"
+    state: directory
+    owner: "{{ jmdn_health_user }}"
+    group: "{{ jmdn_health_group }}"
+    mode: '0700'
+
+- name: "health | Config directory"
+  ansible.builtin.file:
+    path: "{{ jmdn_health_env_dir }}"
+    state: directory
+    owner: root
+    group: "{{ jmdn_health_group }}"
+    mode: '0750'
+
+# Reconcile ownership now that the collector user exists — node_exporter
+# created this directory earlier with a best-effort chown.
+# mode 2750: the setgid bit makes files created here inherit group
+# node_exporter, rather than the writer's primary group. Combined with the
+# script's explicit chgrp this is belt-and-braces; the self-check below is what
+# actually proves it worked.
+- name: "health | Textfile directory ownership (writer=collector, reader=node_exporter)"
+  ansible.builtin.file:
+    path: "{{ jmdn_health_textfile_dir }}"
+    state: directory
+    owner: "{{ jmdn_health_user }}"
+    group: "{{ node_exporter_group | default('node_exporter') }}"
+    mode: '2750'
+
+- name: "health | Render environment file"
+  ansible.builtin.template:
+    src: collector.env.j2
+    dest: "{{ jmdn_health_env_dir }}/collector.env"
+    owner: root
+    group: "{{ jmdn_health_group }}"
+    mode: '0640'
+  no_log: true          # may contain the Explorer API key
+  notify: Run jmdn-health once
+
+- name: "health | Install collector script (syntax-validated before install)"
+  ansible.builtin.copy:
+    src: jmdn-health-collector.sh
+    dest: "{{ jmdn_health_script_path }}"
+    owner: root
+    group: root
+    mode: '0755'
+    # Ansible renders to a temp file, runs this, and only then moves it into
+    # place. A syntax error therefore cannot reach the running system.
+    validate: "sh -n %s"
+  notify: Run jmdn-health once
+
+- name: "health | Install oneshot service unit"
+  ansible.builtin.template:
+    src: jmdn-health.service.j2
+    dest: /etc/systemd/system/jmdn-health.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart jmdn-health timer
+
+- name: "health | Install timer unit"
+  ansible.builtin.template:
+    src: jmdn-health.timer.j2
+    dest: /etc/systemd/system/jmdn-health.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart jmdn-health timer
+
+- name: "health | Enable and start timer"
+  ansible.builtin.systemd:
+    name: jmdn-health.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: "health | Run collector once now so metrics exist immediately"
+  ansible.builtin.systemd:
+    name: jmdn-health.service
+    state: started
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: "health | Confirm the textfile was produced"
+  ansible.builtin.stat:
+    path: "{{ jmdn_health_textfile_dir }}/jmdn_health.prom"
+  register: _hc_out
+  retries: 5
+  delay: 2
+  until: _hc_out.stat.exists | default(false)
+  when: not ansible_check_mode
+
+- name: "health | Fail loudly if the collector produced nothing"
+  ansible.builtin.assert:
+    that:
+      - _hc_out.stat.exists | default(false)
+    fail_msg: >-
+      The health collector ran but wrote no metrics file. Inspect:
+        journalctl -u jmdn-health.service -n 50
+        sudo -u {{ jmdn_health_user }} {{ jmdn_health_script_path }}
+    quiet: true
+  when: not ansible_check_mode
+
+# ------------------------------------------------------------------------------
+# The file existing is not the same as node_exporter being able to READ it.
+# node_exporter runs as its own user; the metrics file is written by
+# jmdn-health. If the group/mode is wrong, node_exporter lists the directory,
+# fails to open the file, and reports node_textfile_scrape_error 1 — with the
+# metrics simply absent. That is exactly what happened on the first real run.
+# Proving readability here keeps the diagnosis in the role that owns the file.
+# ------------------------------------------------------------------------------
+- name: "health | Scrape node_exporter to prove it can read the textfile"
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _hc_scrape
+  retries: 5
+  delay: 3
+  until: _hc_scrape.status is defined and _hc_scrape.status == 200
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: "health | Assert node_exporter actually ingested the textfile"
+  ansible.builtin.assert:
+    that:
+      - "'jmdn_health_collector_last_run_timestamp_seconds' in _hc_scrape.content"
+      - "'node_textfile_scrape_error 0' in _hc_scrape.content"
+    fail_msg: >-
+      node_exporter is not ingesting {{ jmdn_health_textfile_dir }}/jmdn_health.prom.
+      This is a permissions problem, not a collector problem — the file exists.
+      node_exporter runs as '{{ node_exporter_group | default("node_exporter") }}'
+      and must be able to read a file written by '{{ jmdn_health_user }}'. Check:
+        ls -ln {{ jmdn_health_textfile_dir }}/
+        id {{ jmdn_health_user }}
+        curl -s http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics | grep node_textfile_scrape_error
+        journalctl -u node_exporter -n 30 | grep -i textfile
+      Expected: directory {{ jmdn_health_user }}:{{ node_exporter_group | default('node_exporter') }} mode 2750,
+      file group {{ node_exporter_group | default('node_exporter') }} mode 0640.
+    quiet: true
+  when: not ansible_check_mode

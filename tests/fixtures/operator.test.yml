@@ -1,0 +1,17 @@
+---
+# Fixture for the offline render gate. Not a real operator config.
+operator_id: "acme-capital"
+node_id: "acme-validator-1"
+network: "mainnet"
+node_role: "validator"
+telemetry:
+  enabled: true
+  endpoint: "https://otel.jmdt.io"
+  token: "0000000000000000000000000000000000000000000000000000000000000000"
+  forward_node_logs: true
+  scrape_interval: 30
+jmdn_endpoints:
+  explorer_port: 8090
+  facade_port: 8545
+  metrics_port: 8081
+explorer_api_key: "fixture-key"

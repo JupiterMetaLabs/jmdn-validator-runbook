@@ -1,0 +1,9 @@
+---
+# Phase 1 requires NO Galaxy collections — every module used is ansible.builtin.
+# This is deliberate: `pip install ansible-core` is the entire control-side
+# dependency, which keeps the install path short and auditable.
+#
+# Collections will be needed later:
+#   community.general  -> ufw (firewall role, phase 3)
+#   ansible.posix      -> sysctl/mount (os_baseline role, phase 3)
+collections: []

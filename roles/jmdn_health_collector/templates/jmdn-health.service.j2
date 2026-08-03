@@ -1,0 +1,49 @@
+# Managed by jmdn-validator-runbook.
+[Unit]
+Description=JMDN chain-health metric collection (oneshot)
+Documentation=https://github.com/JupiterMetaLabs/jmdn-validator-runbook
+After=network-online.target
+
+[Service]
+Type=oneshot
+User={{ jmdn_health_user }}
+Group={{ jmdn_health_group }}
+EnvironmentFile={{ jmdn_health_env_dir }}/collector.env
+ExecStart={{ jmdn_health_script_path }}
+
+# A collection that cannot finish in 15s is a wedged node, not a slow one.
+TimeoutStartSec=15
+
+# --- Sandboxing ---------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Loopback HTTP only.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+ReadWritePaths={{ jmdn_health_textfile_dir }} {{ jmdn_health_state_dir }}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jmdn-health

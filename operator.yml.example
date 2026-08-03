@@ -1,0 +1,83 @@
+---
+# ==============================================================================
+# operator.yml — the ONLY file you edit.
+#   cp operator.yml.example operator.yml && chmod 600 operator.yml
+#   ${EDITOR:-nano} operator.yml
+# ==============================================================================
+
+# --- Identity -----------------------------------------------------------------
+# Both of these are sent as labels exactly as you set them. Nothing rewrites
+# them server-side, so getting them right is on you.
+#
+# operator_id: assigned by Jupiter Meta — the same identity your telemetry token
+#   was issued for. A wrong value gains you no access to anything, but your node
+#   lands under the wrong identity and your alerts do not reach you.
+#
+# node_id: leave it as "auto" and you never set this. It is taken from
+#   node.alias in /etc/jmdn/jmdn.yaml, which is your node's real identity — the
+#   name the network registers it under — so there is one place to change it and
+#   nothing to keep in sync.
+#
+#   It becomes the `server` label on every metric, and it is the ONLY thing
+#   distinguishing your nodes from each other: `instance` is 127.0.0.1:9100 on
+#   every operator host. Two machines sharing one name produce identical label
+#   sets and the whole submission is rejected.
+#
+#   Set it explicitly ONLY if this machine will never run jmdn — telemetry-only
+#   hosts have no node.alias to derive from. Lowercase [a-z0-9-], 2-63 chars.
+operator_id: "CHANGE_ME"
+node_id: "auto"
+
+# --- Network ------------------------------------------------------------------
+network: mainnet          # selects profiles/<network>.yml
+node_role: validator
+
+# --- Telemetry ----------------------------------------------------------------
+# One outbound HTTPS connection to our ingest gateway. Nothing is opened
+# inbound on your machine. See TELEMETRY.md for the exact list of metrics
+# that leave the box.
+telemetry:
+  enabled: true
+  endpoint: "https://otel.jmdt.io"
+  token: "CHANGE_ME"      # bearer token issued to you
+
+  # Forward jmdn's own logs and traces through the local agent as well, so all
+  # three signals share one credential, one egress path, and one disk buffer
+  # that survives a network outage. Set false to have jmdn talk to the gateway
+  # directly instead (then set logging.otel.endpoint in jmdn.yaml yourself).
+  forward_node_logs: true
+
+  # Seconds between local scrapes. 30 is deliberate: it halves ingest volume
+  # versus 15 with no meaningful loss for VM health, and keeps you inside the
+  # gateway's per-client request budget.
+  scrape_interval: 30
+
+# --- Local endpoints ----------------------------------------------------------
+# Mirror what jmdn actually serves. Read the real values first:
+#     grep -A12 '^ports:' /etc/jmdn/jmdn.yaml
+#     ss -tlnp | grep -E '8090|8545|8081'
+#
+# A value of 0 means "this listener is not enabled" — the health collector skips
+# that probe entirely and emits no series for it, instead of reporting a
+# permanent failure for a node that is correctly configured. Set all three to 0
+# if jmdn is not installed on this machine yet.
+# These three MUST match ports.api / ports.facade / ports.metrics in
+# /etc/jmdn/jmdn.yaml. The values below match jmdn_validator.yaml, the config
+# Stage 1.6 installs — so if you followed the runbook, leave them alone.
+# Stage 3 reads your jmdn.yaml and fails if the two files disagree.
+jmdn_endpoints:
+  explorer_port: 8090     # ports.api     — health, version, DB connectivity
+  facade_port: 8545       # ports.facade  — JSON-RPC, source of block height
+  # ports.metrics — adds p2p peer counts, heartbeat latency, ImmuDB connection
+  # pools and goroutine accounting. jmdn_validator.yaml enables this on
+  # 127.0.0.1, so it is on by default.
+  #
+  # If you started from a jmdn repo template instead, those ship
+  # ports.metrics: 0 — set this to 0 as well, or enable 8081 there first.
+  # Pointing this at a port nothing serves makes the target permanently down.
+  metrics_port: 8081
+
+# Optional. Supplying your Explorer API key lets the health collector also
+# report ImmuDB defaultdb/accountsdb connectivity. It is read locally only and
+# never transmitted. Leave empty to skip those two checks.
+explorer_api_key: ""

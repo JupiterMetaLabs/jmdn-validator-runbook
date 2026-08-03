@@ -1,0 +1,601 @@
+---
+# ==============================================================================
+# verify — read-only health gate. Writes nothing, restarts nothing.
+#
+# Contrast with the internal test_sync_status.yml, which rewrites
+# /etc/jmdn/jmdn.yaml to disable auth and restarts the node. Nothing here
+# mutates the system, so it is safe to run at any time, including during an
+# incident.
+# ==============================================================================
+
+- name: "verify | Collect service state"
+  ansible.builtin.service_facts:
+
+- name: "verify | Read target clock"
+  ansible.builtin.command: date +%s
+  register: _v_now
+  changed_when: false
+  check_mode: false
+
+# ------------------------------------------------------------------------------
+# 1. Telemetry units we installed — hard requirements
+# ------------------------------------------------------------------------------
+- name: "verify | Telemetry units are active"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.services[item + '.service'] is defined
+      - ansible_facts.services[item + '.service'].state == 'running'
+    fail_msg: >-
+      {{ item }}.service is not running. Inspect: journalctl -u {{ item }} -n 50
+    quiet: true
+  loop:
+    - node_exporter
+    - otelcol-contrib
+  when: not (item == 'otelcol-contrib' and not (telemetry.enabled | default(true) | bool))
+
+# ansible.builtin.service_facts collects SERVICES ONLY — its implementation runs
+# `systemctl list-unit-files --type service` and `list-units --type service`.
+# ansible_facts.services['jmdn-health.timer'] can therefore never be defined, so
+# the previous assert on it failed on a host where the timer was running
+# perfectly. Timers must be queried directly.
+- name: "verify | Query the health collector timer"
+  ansible.builtin.command: "systemctl show jmdn-health.timer --property=ActiveState,UnitFileState,NextElapseUSecRealtime --value"
+  register: _v_timer
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "verify | Parse timer state"
+  ansible.builtin.set_fact:
+    _v_timer_active: "{{ (_v_timer.stdout_lines | default([]))[0] | default('unknown') }}"
+    _v_timer_enabled: "{{ (_v_timer.stdout_lines | default([]))[1] | default('unknown') }}"
+
+- name: "verify | Health collector timer is active and enabled"
+  ansible.builtin.assert:
+    that:
+      - _v_timer_active == 'active'
+      - _v_timer_enabled in ['enabled', 'enabled-runtime', 'static']
+    fail_msg: >-
+      jmdn-health.timer is ActiveState={{ _v_timer_active }},
+      UnitFileState={{ _v_timer_enabled }} (both must be active/enabled, or the
+      chain-health metrics stop updating and node_exporter will serve stale
+      values indefinitely). Inspect:
+        systemctl status jmdn-health.timer
+        systemctl list-timers jmdn-health.timer
+        journalctl -u jmdn-health.service -n 50
+    quiet: true
+
+# ------------------------------------------------------------------------------
+# 2. Node units — reported, and failed only if present-but-stopped
+# ------------------------------------------------------------------------------
+- name: "verify | Record node unit states"
+  # Explicit rather than a map() chain: this expression is read during
+  # incidents, and `absent` vs `stopped` is a distinction that matters.
+  ansible.builtin.set_fact:
+    _v_node_units:
+      jmdn: "{{ (ansible_facts.services | default({})).get('jmdn.service', {}).get('state', 'absent') }}"
+      immudb: "{{ (ansible_facts.services | default({})).get('immudb.service', {}).get('state', 'absent') }}"
+      redis-server: "{{ (ansible_facts.services | default({})).get('redis-server.service', {}).get('state', 'absent') }}"
+
+- name: "verify | jmdn and immudb are running if installed"
+  ansible.builtin.assert:
+    that:
+      - _v_node_units[item] in ['running', 'absent']
+    fail_msg: >-
+      {{ item }}.service is installed but its state is
+      '{{ _v_node_units[item] }}'. Inspect: journalctl -u {{ item }} -n 50
+    quiet: true
+  loop: ['jmdn', 'immudb']
+
+- name: "verify | Warn about node units that are not installed"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: {{ item }}.service is not installed on this host. The telemetry
+      layer is healthy, but there is no node to report on yet.
+  loop: ['jmdn', 'immudb', 'redis-server']
+  when: _v_node_units[item] == 'absent'
+
+# ------------------------------------------------------------------------------
+# 3. node_exporter output — the contract our dashboards depend on
+# ------------------------------------------------------------------------------
+- name: "verify | Scrape node_exporter"
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _v_ne
+  retries: 5
+  delay: 3
+  until: _v_ne.status is defined and _v_ne.status == 200
+  changed_when: false
+  check_mode: false
+
+- name: "verify | Required metric families are present"
+  ansible.builtin.assert:
+    that:
+      - item in _v_ne.content
+    fail_msg: >-
+      node_exporter is not exposing '{{ item }}'. Jupiter Meta dashboards and
+      alert rules depend on it. Check the collector whitelist in
+      roles/node_exporter/defaults/main.yml and: journalctl -u node_exporter
+    quiet: true
+  loop:
+    - node_cpu_seconds_total
+    - node_memory_MemAvailable_bytes
+    - node_filesystem_avail_bytes
+    - node_load1
+    - node_network_receive_bytes_total
+    # The two additions this kit exists for:
+    - node_systemd_unit_state
+    - jmdn_health_collector_last_run_timestamp_seconds
+
+- name: "verify | jmdn.service is visible to the systemd collector"
+  ansible.builtin.assert:
+    that:
+      - "'node_systemd_unit_state{name=\"jmdn.service\"' in _v_ne.content"
+    fail_msg: >-
+      node_systemd_unit_state exists but carries no jmdn.service entry. Check
+      node_exporter_systemd_units_regex — without this series, alerts on
+      'is jmdn running' can never fire.
+    quiet: true
+  when: _v_node_units['jmdn'] != 'absent'
+
+# ------------------------------------------------------------------------------
+# 4. Textfile freshness — stale metrics are worse than missing metrics
+# ------------------------------------------------------------------------------
+# A precise signal for the permission failure class: the metric being absent
+# could mean many things; node_textfile_scrape_error names the cause.
+- name: "verify | node_exporter is not erroring on the textfile directory"
+  ansible.builtin.assert:
+    that:
+      - "'node_textfile_scrape_error 0' in _v_ne.content"
+    fail_msg: >-
+      node_textfile_scrape_error is non-zero — node_exporter cannot read the
+      chain-health textfile. Almost always ownership or mode. Check:
+        ls -ln {{ jmdn_textfile_dir | default('/var/lib/node_exporter/textfile') }}/
+        journalctl -u node_exporter -n 30 | grep -i textfile
+    quiet: true
+
+- name: "verify | Parse collector timestamp and probe failures"
+  ansible.builtin.set_fact:
+    _v_ts: >-
+      {{ (_v_ne.content
+          | regex_findall('^jmdn_health_collector_last_run_timestamp_seconds ([0-9.e+]+)$', multiline=True)
+          | first | default(0)) | float | int }}
+    _v_probe_failures: >-
+      {{ (_v_ne.content
+          | regex_findall('^jmdn_health_collector_probe_failures ([0-9.e+]+)$', multiline=True)
+          | first | default(-1)) | float | int }}
+
+- name: "verify | Collector output is fresh"
+  ansible.builtin.assert:
+    that:
+      - _v_ts | int > 0
+      - ((_v_now.stdout | int) - (_v_ts | int)) < (jmdn_health_interval_seconds | default(30) | int * verify_staleness_factor | int)
+    fail_msg: >-
+      Chain-health metrics are {{ (_v_now.stdout | int) - (_v_ts | int) }}s old
+      (tolerance {{ jmdn_health_interval_seconds | default(30) | int * verify_staleness_factor | int }}s).
+      node_exporter serves stale textfile metrics indefinitely, so this means
+      the collector has stopped, not that the node is idle. Inspect:
+        systemctl status jmdn-health.timer
+        journalctl -u jmdn-health.service -n 50
+    quiet: true
+
+- name: "verify | Local endpoint probes all succeeded"
+  ansible.builtin.assert:
+    that:
+      - _v_probe_failures | int == 0
+    fail_msg: >-
+      {{ _v_probe_failures }} of the local JMDN endpoint probes failed. See the
+      jmdn_endpoint_up series:
+        curl -s http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics | grep jmdn_endpoint_up
+    quiet: true
+  when: _v_node_units['jmdn'] != 'absent'
+
+# ------------------------------------------------------------------------------
+# 4b. Cross-check: does the collector probe everything jmdn actually serves?
+#
+# The failure this catches: an operator installs jmdn AFTER the telemetry layer,
+# and never updates jmdn_endpoints in operator.yml. Every unit is healthy, the
+# collector reports probe_failures 0 because it is probing nothing, and the whole
+# L3 + L4 layer is silently absent. Nothing else in this play notices, because
+# "0 probes, 0 failures" is a legitimate state on a host with no node.
+#
+# Reading jmdn.yaml is the only way to tell the two apart.
+# ------------------------------------------------------------------------------
+- name: "verify | Look for a jmdn config to cross-check against"
+  ansible.builtin.stat:
+    path: "{{ jmdn_config_path }}"
+  register: _v_jmdncfg
+
+- name: "verify | Read the ports jmdn is configured to serve"
+  # no_log: jmdn.yaml holds jwt_secret, explorer_api_key, and DB/Redis
+  # passwords. Only the three port numbers are extracted below.
+  ansible.builtin.slurp:
+    src: "{{ jmdn_config_path }}"
+  register: _v_jmdnraw
+  no_log: true
+  when: _v_jmdncfg.stat.exists | default(false)
+
+- name: "verify | Extract just the port numbers and the node alias"
+  ansible.builtin.set_fact:
+    _v_jmdn_ports:
+      explorer: "{{ (_v_jmdnraw.content | b64decode | from_yaml).ports.api | default(0) | int }}"
+      facade: "{{ (_v_jmdnraw.content | b64decode | from_yaml).ports.facade | default(0) | int }}"
+      metrics: "{{ (_v_jmdnraw.content | b64decode | from_yaml).ports.metrics | default(0) | int }}"
+    _v_jmdn_alias: "{{ ((_v_jmdnraw.content | b64decode | from_yaml).node | default({})).alias | default('') }}"
+    _v_jmdn_svcname: "{{ ((_v_jmdnraw.content | b64decode | from_yaml).logging | default({})).service_name | default('') }}"
+  when: _v_jmdncfg.stat.exists | default(false)
+
+# ------------------------------------------------------------------------------
+# node.alias vs the resolved node name — reported, never corrected.
+#
+# node.alias is what jmdn registers with the seednode and what appears in its
+# logs; jmdn_node_id is the `server` label on every metric. When they differ, a metric
+# cannot be tied back to a log line, which is exactly the correlation you want
+# during an incident.
+#
+# This is deliberately a WARNING and deliberately not fixed automatically:
+#   * node.alias is read at STARTUP (main.go RegisterPeerWithAlias) and jmdn has
+#     no config hot-reload, so writing it would take effect only on the next
+#     restart — config and running state would diverge silently.
+#   * Correcting it means restarting jmdn. A telemetry playbook must never bounce
+#     a validator out of consensus.
+# The kit only ever reads jmdn.yaml. Fix a mismatch yourself, on your schedule.
+# ------------------------------------------------------------------------------
+- name: "verify | This node's name must be identical in all three places"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this node is named inconsistently, so its metrics, logs and traces
+      will land under different names and cannot be correlated.
+      metrics carry server="{{ jmdn_node_id }}"
+      (from {{ _id_source | default('operator.yml') }});
+      jmdn.yaml node.alias = "{{ _v_jmdn_alias | default('') | ternary(_v_jmdn_alias, '<unset>') }}"
+      (jmdn's logs and its seednode registration);
+      jmdn.yaml logging.service_name = "{{ _v_jmdn_svcname | default('') | ternary(_v_jmdn_svcname, '<unset>') }}"
+      (service.name on forwarded logs and traces).
+      Set all three to the same string. Not a health problem, and nothing here
+      changes it — node.alias is read only at jmdn startup, so correcting it needs
+      a restart you should schedule yourself.
+  when:
+    - _v_jmdncfg.stat.exists | default(false)
+    # jmdn_node_id, never node_id: with node_id "auto" the literal is not a name,
+    # and comparing it would flag every correctly-configured node.
+    - (_v_jmdn_alias | default('') | length > 0 and _v_jmdn_alias != jmdn_node_id)
+      or (_v_jmdn_svcname | default('') | length > 0 and _v_jmdn_svcname != jmdn_node_id)
+
+- name: "verify | The collector must probe every endpoint jmdn serves"
+  ansible.builtin.assert:
+    that:
+      - not (_v_jmdn_ports.explorer | int > 0 and (jmdn_endpoints.explorer_port | default(0) | int) == 0)
+      - not (_v_jmdn_ports.facade | int > 0 and (jmdn_endpoints.facade_port | default(0) | int) == 0)
+      - not (_v_jmdn_ports.metrics | int > 0 and (jmdn_endpoints.metrics_port | default(0) | int) == 0)
+    fail_msg: >-
+      jmdn is serving endpoints the collector is not probing, so chain health is
+      silently missing. {{ jmdn_config_path }} has
+      ports.api={{ _v_jmdn_ports.explorer }},
+      ports.facade={{ _v_jmdn_ports.facade }},
+      ports.metrics={{ _v_jmdn_ports.metrics }},
+      while operator.yml has
+      explorer_port={{ jmdn_endpoints.explorer_port | default(0) }},
+      facade_port={{ jmdn_endpoints.facade_port | default(0) }},
+      metrics_port={{ jmdn_endpoints.metrics_port | default(0) }}.
+      Set them to match in operator.yml and re-run observability.yml. Use 0 only
+      for a listener jmdn genuinely does not serve.
+    quiet: true
+  when: _v_jmdncfg.stat.exists | default(false)
+
+- name: "verify | Note endpoints configured but not served"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: operator.yml probes a port jmdn does not serve. That produces a
+      permanent jmdn_endpoint_up 0. Set the unserved port to 0 in operator.yml.
+  when:
+    - _v_jmdncfg.stat.exists | default(false)
+    - (jmdn_endpoints.explorer_port | default(0) | int > 0 and _v_jmdn_ports.explorer | int == 0)
+      or (jmdn_endpoints.facade_port | default(0) | int > 0 and _v_jmdn_ports.facade | int == 0)
+      or (jmdn_endpoints.metrics_port | default(0) | int > 0 and _v_jmdn_ports.metrics | int == 0)
+
+# ------------------------------------------------------------------------------
+# 4c. Exposure gate — is anything reachable from the internet that should not be?
+#
+# Policy: only facade (8545) and ws (8546) may face the internet, alongside P2P
+# 15000/15001 which is not configured under ports/binds at all. Upstream ships
+# binds.did as 0.0.0.0, so this catches the operator who copied that.
+#
+# Widen or narrow the allowance with verify_public_listeners; admin surfaces are
+# asserted separately and cannot be allowed.
+# ------------------------------------------------------------------------------
+- name: "verify | Find listeners bound off-loopback in jmdn.yaml"
+  vars:
+    _cfg: "{{ _v_jmdnraw.content | b64decode | from_yaml }}"
+    # Iterates verify_all_listeners, NOT the union of the classifier lists —
+    # otherwise emptying verify_public_listeners would remove facade/ws from
+    # consideration instead of flagging them.
+    _exposed_json: >-
+      {%- set out = [] -%}
+      {%- for k in verify_all_listeners -%}
+        {%- set p = _cfg.ports[k] | default(0) | int -%}
+        {%- set b = _cfg.binds[k] | default('127.0.0.1') | string -%}
+        {%- if p > 0 and b not in verify_loopback_addresses
+               and k not in verify_public_listeners -%}
+          {%- set _ = out.append({'key': k, 'port': p, 'bind': b,
+                                  'admin': k in verify_admin_listeners}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out | to_json }}
+    # Ports that must be loopback-only. Used by the live-socket cross-check
+    # below, and deliberately EXCLUDES verify_public_listeners — 8545/8546 are
+    # supposed to be off-loopback, so watching them would flag a correct node.
+    _private_ports_json: >-
+      {%- set out = [] -%}
+      {%- for k in verify_all_listeners -%}
+        {%- set p = _cfg.ports[k] | default(0) | int -%}
+        {%- if p > 0 and k not in verify_public_listeners -%}
+          {%- set _ = out.append(p) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out | to_json }}
+  ansible.builtin.set_fact:
+    _v_exposed: "{{ _exposed_json | from_json }}"
+    _v_private_ports: "{{ _private_ports_json | from_json }}"
+  when: _v_jmdncfg.stat.exists | default(false)
+
+- name: "verify | No admin surface may face the internet"
+  ansible.builtin.assert:
+    that:
+      - _v_exposed | selectattr('admin') | list | length == 0
+    fail_msg: >-
+      ADMIN SURFACE EXPOSED. {{ jmdn_config_path }} binds
+      {{ _v_exposed | selectattr('admin') | map(attribute='key') | join(', ') }}
+      to a non-loopback address
+      ({{ _v_exposed | selectattr('admin')
+           | map(attribute='bind') | join(', ') }}).
+      These grant control of your node. Set binds.cli and binds.blockgen to
+      127.0.0.1 (or ports to 0) and restart jmdn. Reach the CLI over an SSH
+      tunnel. This check cannot be waived.
+    quiet: true
+  when: _v_jmdncfg.stat.exists | default(false)
+
+- name: "verify | Only JSON-RPC and WebSocket may face the internet"
+  ansible.builtin.assert:
+    that:
+      - _v_exposed | rejectattr('admin') | list | length == 0
+    fail_msg: >-
+      PUBLICLY EXPOSED LISTENERS. {{ jmdn_config_path }} has
+      {% for e in _v_exposed | rejectattr('admin') %}
+      {{ e.key }}={{ e.port }} bound {{ e.bind }}{% if not loop.last %},{% endif %}
+      {% endfor %}.
+      Only facade (8545) and ws (8546) may be public, plus P2P 15000/15001.
+      Upstream ships binds.did as 0.0.0.0, which is the usual cause — set it to
+      127.0.0.1 and restart jmdn. See Stage 1.6 of the runbook, or start from
+      jmdn_validator.yaml which already has the correct binds.
+    quiet: true
+  when: _v_jmdncfg.stat.exists | default(false)
+
+# Config alone is not proof: a -facade/-ws flag in the unit overrides the file.
+- name: "verify | List TCP listening sockets"
+  ansible.builtin.command: ss -Hltn
+  changed_when: false
+  failed_when: false
+  register: _v_ss
+
+- name: "verify | Cross-check the live sockets against the config"
+  vars:
+    # jmdn's loopback-only ports PLUS ImmuDB's, which are not in jmdn.yaml at all
+    # and bind every interface by default.
+    _watch: "{{ (_v_private_ports | default([])) + verify_immudb_private_ports }}"
+    _live_json: >-
+      {%- set out = [] -%}
+      {%- for line in _v_ss.stdout_lines | default([]) -%}
+        {%- set f = line.split() -%}
+        {%- if f | length >= 4 and ':' in f[3] -%}
+          {%- set addr = f[3] -%}
+          {%- set port = addr.split(':') | last -%}
+          {%- set host = addr[:addr.rfind(':')] -%}
+          {%- if port | int in (_watch | map('int') | list)
+                 and host not in verify_loopback_addresses -%}
+            {%- set _ = out.append(host ~ ':' ~ port) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out | to_json }}
+  ansible.builtin.set_fact:
+    _v_live_exposed: "{{ _live_json | from_json }}"
+  when: _v_ss.rc | default(1) == 0
+
+- name: "verify | Live sockets must agree with the config"
+  ansible.builtin.assert:
+    that:
+      - _v_live_exposed | length == 0
+    fail_msg: >-
+      A port that should be loopback-only is LISTENING off-loopback:
+      {{ _v_live_exposed | join(', ') }}.
+      If 8080, 9497, 5432 or 3322 appear, that is ImmuDB on its defaults — it is
+      started as `immudb --dir ...` with no bind flags, and 8080 is a web console
+      into your chain database using the built-in immudb/immudb credentials.
+      Block them at the firewall or security group; nothing outside this machine
+      needs them.
+      For any other port, jmdn.yaml does not ask for it, so something is
+      overriding the config — most likely a -did/-api/-metrics flag in
+      /etc/systemd/system/jmdn.service, which outranks the file. Check its
+      ExecStart and restart jmdn.
+    quiet: true
+  when: _v_live_exposed is defined
+
+# ------------------------------------------------------------------------------
+# 5. Block height advancing — the signal that matters most
+# ------------------------------------------------------------------------------
+# Re-scrape rather than reuse the content captured earlier in the play: several
+# tasks have run since, and a baseline that is minutes stale makes "advanced"
+# trivially true.
+- name: "verify | Re-scrape for a fresh height baseline"
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _v_ne_base
+  changed_when: false
+  check_mode: false
+
+- name: "verify | Record starting block height"
+  ansible.builtin.set_fact:
+    _v_h0: >-
+      {{ (_v_ne_base.content | regex_findall('^jmdn_block_height ([0-9.e+]+)$', multiline=True)
+          | first | default(-1)) | float | int }}
+
+# Peer count is the discriminator between "at the chain tip" and "stalled".
+# Flat height alone cannot tell those apart, and treating flat as stalled fails a
+# perfectly healthy node whenever the chain is quiet. jmdn's own metrics endpoint
+# carries the peer gauges; node_exporter does not.
+- name: "verify | Read peer count from jmdn's metrics endpoint"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ jmdn_endpoints.metrics_port }}/metrics"
+    return_content: true
+    timeout: 10
+  register: _v_p2p
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: (jmdn_endpoints.metrics_port | default(0) | int) > 0
+
+- name: "verify | Parse peer count"
+  ansible.builtin.set_fact:
+    _v_peers: >-
+      {{ ((_v_p2p.content | default('')
+           | regex_findall('^p2p_connected_peers_total ([0-9.e+]+)$', multiline=True)
+           | first | default(-1)) | float | int) }}
+
+- name: "verify | Wait for the block height to advance"
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_address | default('127.0.0.1:9100') }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _v_ne2
+  changed_when: false
+  check_mode: false
+  retries: "{{ ((verify_height_timeout_seconds | int) / 10) | int }}"
+  delay: 10
+  until: >-
+    (_v_ne2.content | regex_findall('^jmdn_block_height ([0-9.e+]+)$', multiline=True)
+     | first | default(-1)) | float | int > (_v_h0 | int)
+  failed_when: false
+  when:
+    - _v_node_units['jmdn'] != 'absent'
+    - _v_h0 | int >= 0
+    - not ansible_check_mode
+
+- name: "verify | Record whether the height moved"
+  ansible.builtin.set_fact:
+    _v_h1: >-
+      {{ (_v_ne2.content | default('')
+          | regex_findall('^jmdn_block_height ([0-9.e+]+)$', multiline=True)
+          | first | default(-1)) | float | int }}
+  when: _v_ne2 is defined
+
+# Flat height with healthy peers means this node is AT the chain tip, waiting for
+# the network to produce a block — a correct state, not a failure. Flat height
+# with no peers means it is isolated. Only the second is a fault.
+- name: "verify | Height is flat but the node is peered — at the chain tip"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: block height held at {{ _v_h0 }} for
+      {{ verify_height_timeout_seconds }}s, but this node has
+      {{ _v_peers }} connected peers. That is what a node sitting at the chain
+      tip looks like on a quiet chain — it is not a stall. If you expected blocks
+      in that window, check: journalctl -u jmdn -n 100
+  when:
+    - _v_node_units['jmdn'] != 'absent'
+    - _v_h0 | int >= 0
+    - _v_h1 | default(-1) | int <= _v_h0 | int
+    - _v_peers | int > 0
+    - not ansible_check_mode
+
+- name: "verify | The node must be syncing or peered"
+  ansible.builtin.assert:
+    that:
+      - (_v_h1 | default(-1) | int > _v_h0 | int) or (_v_peers | int > 0)
+    fail_msg: >-
+      Block height did not advance from {{ _v_h0 }} within
+      {{ verify_height_timeout_seconds }}s AND this node has
+      {{ _v_peers | int < 0 | ternary('an unknown number of', _v_peers) }} peers.
+      A node that is neither advancing nor peered is not participating.
+      Check inbound 15000 (TCP *and* UDP) first — that is the usual cause — then:
+        journalctl -u jmdn -n 100
+      Set verify_height_required=false to skip this gate entirely.
+    quiet: true
+  when:
+    - verify_height_required | bool
+    - _v_node_units['jmdn'] != 'absent'
+    - _v_h0 | int >= 0
+    - not ansible_check_mode
+
+# ------------------------------------------------------------------------------
+# 6. Are we actually receiving the data? The operator's proof.
+# ------------------------------------------------------------------------------
+- name: "verify | Wait for a successful export to Jupiter Meta"
+  ansible.builtin.uri:
+    url: "http://{{ otel_agent_self_metrics_address | default('127.0.0.1:8888') }}/metrics"
+    return_content: true
+    timeout: 15
+  register: _v_self
+  changed_when: false
+  check_mode: false
+  retries: "{{ ((verify_export_timeout_seconds | int) / 10) | int }}"
+  delay: 10
+  until: >-
+    (_v_self.content | default('')
+     | regex_findall('^otelcol_exporter_sent_metric_points[^ ]* ([0-9.e+]+)$', multiline=True)
+     | map('float') | sum) > 0
+  failed_when: false
+  when:
+    - telemetry.enabled | default(true) | bool
+    - not ansible_check_mode
+
+- name: "verify | Summarise export counters"
+  ansible.builtin.set_fact:
+    _v_sent: >-
+      {{ (_v_self.content | default('')
+          | regex_findall('^otelcol_exporter_sent_metric_points[^ ]* ([0-9.e+]+)$', multiline=True)
+          | map('float') | sum) | int }}
+    _v_failed: >-
+      {{ (_v_self.content | default('')
+          | regex_findall('^otelcol_exporter_send_failed_metric_points[^ ]* ([0-9.e+]+)$', multiline=True)
+          | map('float') | sum) | int }}
+  when:
+    - telemetry.enabled | default(true) | bool
+    - not ansible_check_mode
+
+- name: "verify | Telemetry is reaching the gateway"
+  ansible.builtin.assert:
+    that:
+      - _v_sent | int > 0
+    fail_msg: >-
+      The agent has exported 0 metric points ({{ _v_failed | default(0) }}
+      failures). Most likely: a rejected bearer token (HTTP 401) or blocked
+      egress. Inspect:
+        journalctl -u otelcol-contrib -n 80
+        curl -s http://{{ otel_agent_self_metrics_address | default('127.0.0.1:8888') }}/metrics | grep otelcol_exporter
+    quiet: true
+  when:
+    - telemetry.enabled | default(true) | bool
+    - not ansible_check_mode
+
+# ------------------------------------------------------------------------------
+# 7. Verdict
+# ------------------------------------------------------------------------------
+- name: "verify | VERDICT"
+  ansible.builtin.debug:
+    msg: >-
+      {{ [
+        'node        : ' ~ jmdn_node_id ~ '  (operator ' ~ operator_id ~ ', chain ' ~ jmdn_identity.chain_id ~ ')',
+        'jmdn        : ' ~ _v_node_units['jmdn'],
+        'immudb      : ' ~ _v_node_units['immudb'],
+        'redis       : ' ~ _v_node_units['redis-server'],
+        'block height: ' ~ (_v_h0 | int if (_v_h0 | int) >= 0 else 'not reported'),
+        'probes failed: ' ~ _v_probe_failures,
+        'metrics age : ' ~ ((_v_now.stdout | int) - (_v_ts | int)) ~ 's',
+        'health timer: ' ~ _v_timer_active ~ ' / ' ~ _v_timer_enabled,
+        'exported    : ' ~ (_v_sent | default('n/a')) ~ ' points, ' ~ (_v_failed | default('n/a')) ~ ' failures',
+        'VERDICT     : HEALTHY'
+      ] }}

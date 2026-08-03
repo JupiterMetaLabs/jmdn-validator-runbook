@@ -1,0 +1,42 @@
+---
+# ==============================================================================
+# observability.yml — telemetry layer for a JMDN node.
+#
+# Installs: node_exporter (host + systemd + textfile), a chain-health collector
+# timer, and an OTel agent that pushes to Jupiter Meta's ingest gateway.
+# Does NOT touch jmdn, immudb, redis, or /etc/jmdn/jmdn.yaml.
+#
+#   sudo ansible-playbook observability.yml --check --diff   # dry run
+#   sudo ansible-playbook observability.yml                  # apply
+#   sudo ansible-playbook verify.yml                         # prove it
+# ==============================================================================
+
+- name: "JMDN operator node — observability layer"
+  hosts: operator_node
+  become: true
+  gather_facts: true
+  vars_files:
+    - operator.yml
+    - "profiles/{{ network | default('mainnet') }}.yml"
+
+  roles:
+    # Resolves this node's name (node_id: "auto" -> node.alias) before any
+    # role templates it into a config.
+    - role: identity
+
+    - role: preflight
+      tags: [preflight]
+    - role: node_exporter
+      tags: [node_exporter, metrics]
+    - role: jmdn_health_collector
+      tags: [health, metrics]
+    - role: otel_agent
+      tags: [agent, telemetry]
+
+  post_tasks:
+    - name: "Next step"
+      ansible.builtin.debug:
+        msg:
+          - "Observability layer applied."
+          - "Metrics need one scrape interval ({{ telemetry.scrape_interval | default(30) }}s) plus one export cycle to appear."
+          - "Now run:  sudo ansible-playbook verify.yml"

@@ -1,0 +1,83 @@
+---
+# Block height must advance within this window. A JMDN validator that is not
+# advancing is the single most important failure mode, so this is a hard gate
+# by default. Set verify_height_required=false if you are deliberately verifying
+# against an idle chain.
+verify_height_timeout_seconds: 120
+verify_height_required: true
+
+# Freshness tolerance for the textfile collector, as a multiple of its interval.
+# Stale textfile metrics are served indefinitely by node_exporter, so a frozen
+# value is indistinguishable from a healthy one without this check.
+verify_staleness_factor: 3
+
+# How long to wait for the agent's first successful export after a fresh
+# install (one scrape interval plus one batch window plus headroom).
+verify_export_timeout_seconds: 120
+
+# --- Exposure gate --------------------------------------------------------------
+# Network policy: exactly four ports face the internet — P2P 15000 (TCP+UDP),
+# Yggdrasil 15001, JSON-RPC 8545 and WebSocket 8546. Every other listener is
+# internal. jmdn_default.yaml ships binds.did as 0.0.0.0, which violates that,
+# so the runbook tells operators to fix it and this gate proves they did.
+# Documentation is not enforcement.
+#
+# Checked two ways, because they fail differently:
+#   1. jmdn.yaml binds  — catches the config the operator forgot to change.
+#   2. live sockets     — catches a -did/-api command-line flag in the unit,
+#                         which overrides the config file silently.
+
+# Every listener key under ports/binds in jmdn.yaml. This is the set that gets
+# examined; the two lists below only CLASSIFY it. Keeping iteration independent
+# of the allow-list matters: if the loop iterated the union of the lists instead,
+# emptying verify_public_listeners would stop facade/ws being examined rather
+# than start flagging them, and the hardening switch below would be a no-op.
+#
+# P2P (15000/15001) is deliberately absent: it is not configured under
+# ports/binds, and it MUST be publicly reachable.
+verify_all_listeners:
+  - api        # Explorer API — fronts chain and DB state
+  - did        # DID service — ships 0.0.0.0 upstream, must be changed
+  - metrics    # Prometheus metrics
+  - profiler   # pprof — debugging only
+  - facade     # JSON-RPC 8545
+  - ws         # WebSocket 8546
+  - cli        # admin: full node control
+  - blockgen   # admin: block generation
+  - blockgrpc  # admin: block propagation gRPC
+
+# Permitted to face the internet. facade/ws are here because JMDN nodes are
+# expected to serve JSON-RPC.
+#
+# A validator that does NOT serve public RPC should empty this list:
+#   ansible-playbook verify.yml -e '{"verify_public_listeners":[]}'
+# Public unauthenticated RPC is free to hammer, discloses node state, and
+# competes with consensus for CPU. Nothing in this kit needs it — the health
+# collector reads the facade on 127.0.0.1.
+verify_public_listeners:
+  - facade
+  - ws
+
+# Admin control surfaces. Exposing these is never acceptable, so they are
+# asserted separately and verify_public_listeners cannot cover them.
+verify_admin_listeners:
+  - cli
+  - blockgen
+  - blockgrpc
+
+# ImmuDB is started as `immudb --dir ...` with no other flags, so its own
+# defaults apply and it binds ALL interfaces: 8080 (web console + Swagger + web
+# API), 9497 (metrics), 5432 (pgsql wire), 3322 (gRPC). It runs with the built-in
+# immudb/immudb credentials, so an exposed 8080 is a console into the chain
+# database. These are not in jmdn.yaml, so they need their own list.
+verify_immudb_private_ports:
+  - 8080
+  - 9497
+  - 5432
+  - 3322
+
+verify_loopback_addresses:
+  - "127.0.0.1"
+  - "::1"
+  - "[::1]"
+  - "localhost"

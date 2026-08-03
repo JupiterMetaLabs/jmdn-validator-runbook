@@ -1,0 +1,96 @@
+---
+# ==============================================================================
+# node_exporter — host, systemd-unit and textfile metrics. Loopback only.
+# ==============================================================================
+
+# Pinned to the version running on Jupiter Meta's own fleet. One variable to
+# bump; the role is version-aware, so a bump is a rolling upgrade, not a
+# reinstall.
+node_exporter_version: "1.8.2"
+
+# Loopback only. The local OTel agent is the sole consumer — nothing off-box
+# needs to reach this port, and binding it publicly is how node_exporter
+# becomes an information-disclosure surface.
+node_exporter_listen_address: "127.0.0.1:9100"
+
+node_exporter_user: "node_exporter"
+node_exporter_group: "node_exporter"
+node_exporter_install_path: "/usr/local/bin/node_exporter"
+
+# Written by the health collector, read by node_exporter. Overridden centrally
+# in group_vars/all/main.yml so both roles agree.
+node_exporter_textfile_dir: "/var/lib/node_exporter/textfile"
+
+# --- Collector whitelist ------------------------------------------------------
+# We run with --collector.disable-defaults and enable only what is consumed.
+# Upstream defaults enable ~40 collectors, many irrelevant to a cloud VM
+# (mdadm, ipvs, infiniband, xfs, zfs, nfsd, fibrechannel, tapestats...). Each
+# costs CPU on every scrape and series storage forever.
+#
+# Whitelisting rather than blacklisting means the series count is deterministic
+# and a node_exporter upgrade cannot silently switch new collectors on.
+# Budget: roughly 350-450 series per node with this set.
+node_exporter_collectors_enabled:
+  # --- consumed by existing Jupiter Meta dashboards and alert rules ---
+  - cpu             # node_cpu_seconds_total
+  - meminfo         # node_memory_MemAvailable_bytes / MemTotal_bytes
+  - filesystem      # node_filesystem_{size,avail}_bytes
+  - diskstats       # node_disk_{read,written}_bytes_total
+  - netdev          # node_network_{receive,transmit}_bytes_total
+  - loadavg         # node_load1
+  # --- operational context ---
+  - stat            # boot time, context switches, forks
+  - vmstat          # paging pressure
+  - filefd          # fd exhaustion, a real failure mode for a P2P node
+  - uname           # kernel version, for correlating incidents to upgrades
+  - os              # distro release
+  - time            # node_time_seconds
+  - timex           # node_timex_{offset_seconds,sync_status} — clock discipline
+  - pressure        # PSI: earliest warning for cpu/io/memory contention
+  # --- P2P relevant network health ---
+  - netstat         # TCP retransmits, connection states
+  - sockstat        # socket exhaustion
+  # --- the two additions this kit exists for ---
+  - systemd         # node_systemd_unit_state — is jmdn actually running
+  - textfile        # chain health from the local collector
+
+# Units the systemd collector reports on. Left open, this collector enumerates
+# every unit on the box and is a well-known cardinality amplifier.
+#
+# node_exporter itself is in the list for a specific reason: this role's
+# post-start self-check fails the play if node_systemd_unit_state is absent, and
+# on a machine where jmdn is not installed yet, NONE of the other units exist at
+# that point — otelcol-contrib and jmdn-health are created by later roles in the
+# same play. With zero matching units the collector emits zero series and the
+# self-check would fail on a legitimately healthy host. Including the unit we
+# have just started guarantees the check always has a subject, and gives us
+# exporter self-monitoring for free.
+#
+# NOTE: written as [.] rather than \. deliberately — systemd parses backslash
+# escapes in ExecStart and warns "Ignoring unknown escape sequences" on \.
+node_exporter_systemd_units_regex: '^(jmdn|immudb|redis-server|otelcol-contrib|jmdn-health|node_exporter)[.]service$'
+
+# Version-dependent systemd sub-flags. Restart counters are what distinguish a
+# crash-looping node from a healthy one — "active" alone cannot.
+# Validated against the installed binary before the unit is written.
+node_exporter_systemd_extra_args:
+  - "--collector.systemd.enable-restarts-metrics"
+  - "--collector.systemd.enable-start-time-metrics"
+
+# Filesystem noise suppression. Matches the fstype filter already used in
+# Jupiter Meta's dashboards and alert rules.
+node_exporter_fs_mount_exclude: '^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/kubelet/.+|snap/.+)($|/)'
+node_exporter_fs_types_exclude: '^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs|tmpfs)$'
+
+# Drops ~40 go_*/promhttp_* self-metrics. `up` and node_scrape_collector_success
+# still tell us the exporter is healthy, so this is free.
+node_exporter_disable_exporter_metrics: true
+
+node_exporter_extra_args: []
+
+# --- Resource caps ------------------------------------------------------------
+# Measured RSS is 15-25 MB with this collector set. Caps exist so a leak can
+# never compete with jmdn for memory or CPU.
+node_exporter_memory_max: "80M"
+node_exporter_memory_high: "60M"
+node_exporter_cpu_quota: "10%"

@@ -1,0 +1,9 @@
+---
+# JMDN testnet profile — values to be published by Jupiter Meta.
+# Intentionally shipped as .example rather than filled in with guesses.
+network_profile:
+  name: testnet
+  chain_id: 0          # TODO: publish
+  seed_node: ""        # TODO: publish
+  mempool: ""          # TODO: publish
+  seed_authority_bls_pub: ""

@@ -1,0 +1,20 @@
+---
+# ==============================================================================
+# verify.yml — read-only health gate. Mutates nothing. Exits non-zero on failure.
+#
+# Deliberately different from the internal test_sync_status.yml, which
+# temporarily rewrites /etc/jmdn/jmdn.yaml to disable auth and restarts the
+# node. Nothing here writes to disk or restarts a service.
+# ==============================================================================
+
+- name: "JMDN operator node — verify"
+  hosts: operator_node
+  become: true
+  gather_facts: true
+  vars_files:
+    - operator.yml
+    - "profiles/{{ network | default('mainnet') }}.yml"
+
+  roles:
+    - role: identity
+    - role: verify

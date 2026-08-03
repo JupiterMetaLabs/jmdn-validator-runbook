@@ -1,0 +1,8 @@
+---
+# JMDN mainnet network profile — published by Jupiter Meta. Do not edit.
+# Values verified against the production fleet configuration.
+network_profile:
+  name: mainnet
+  chain_id: 7000700
+  # Consumed by the jmdn_config role (phase 3), not by the observability layer.
+  seed_authority_bls_pub: ""

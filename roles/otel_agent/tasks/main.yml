@@ -1,0 +1,256 @@
+---
+# ==============================================================================
+# otel_agent
+#
+# IDEMPOTENCY: version-aware install; config/unit are templates with
+#   change-triggered handlers. A no-op run reports changed=0.
+# SAFETY:      release checksum verified before install; the rendered config is
+#   validated by the collector's own `validate` subcommand BEFORE it replaces
+#   the live config, so a bad render cannot take telemetry down.
+# SECRETS:     the bearer token lives only in a 0600 EnvironmentFile. It is
+#   never in the config file, never in argv (so never in `ps`), and every task
+#   that touches it sets no_log.
+# ==============================================================================
+
+- name: "agent | Map architecture to release suffix"
+  ansible.builtin.set_fact:
+    _oa_arch: >-
+      {{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}
+
+- name: "agent | Compute release artifact names"
+  ansible.builtin.set_fact:
+    _oa_tarball: "{{ otel_agent_dist }}_{{ otel_agent_version }}_linux_{{ _oa_arch }}.tar.gz"
+    # VERIFIED against the real v0.144.0 release, 2026-07-28. The checksum asset
+    # is named after the RELEASE REPOSITORY and the distribution — it carries no
+    # version, and it is NOT "<dist>_<version>_checksums.txt", which 404s at
+    # every version from 0.140 to 0.145. Getting this wrong fails the install.
+    #   https://github.com/open-telemetry/opentelemetry-collector-releases/
+    #     releases/download/v0.144.0/
+    #     opentelemetry-collector-releases_otelcol-contrib_checksums.txt
+    # The same pattern holds for the otelcol, otelcol-k8s and otelcol-otlp
+    # distributions, so it generalises via otel_agent_dist.
+    _oa_sums: "opentelemetry-collector-releases_{{ otel_agent_dist }}_checksums.txt"
+    _oa_base_url: "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{{ otel_agent_version }}"
+
+- name: "agent | Create system group"
+  ansible.builtin.group:
+    name: "{{ otel_agent_group }}"
+    system: true
+    state: present
+
+- name: "agent | Create system user"
+  ansible.builtin.user:
+    name: "{{ otel_agent_user }}"
+    group: "{{ otel_agent_group }}"
+    system: true
+    shell: "{{ jmdn_nologin_shell | default('/usr/sbin/nologin') }}"
+    create_home: false
+    state: present
+
+- name: "agent | Create directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ otel_agent_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ otel_agent_config_dir }}", owner: "root", mode: "0750" }
+    - { path: "{{ otel_agent_state_dir }}", owner: "{{ otel_agent_user }}", mode: "0750" }
+    - { path: "{{ otel_agent_queue_dir }}", owner: "{{ otel_agent_user }}", mode: "0700" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# ------------------------------------------------------------------------------
+# Version-aware install
+# ------------------------------------------------------------------------------
+- name: "agent | Stat existing binary"
+  ansible.builtin.stat:
+    path: "{{ otel_agent_install_path }}"
+  register: _oa_bin
+
+- name: "agent | Read installed version"
+  ansible.builtin.command: "{{ otel_agent_install_path }} --version"
+  register: _oa_ver_out
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _oa_bin.stat.exists
+
+- name: "agent | Parse installed version"
+  ansible.builtin.set_fact:
+    _oa_installed: >-
+      {{ ((_oa_ver_out.stdout | default('')) ~ ' ' ~ (_oa_ver_out.stderr | default('')))
+         | regex_search('([0-9]+\.[0-9]+\.[0-9]+)', '\1')
+         | default([], true) | first | default('') }}
+
+- name: "agent | Decide whether install is needed"
+  ansible.builtin.set_fact:
+    _oa_install: "{{ (not _oa_bin.stat.exists) or (_oa_installed != otel_agent_version) }}"
+
+# Same check-mode limitation as node_exporter: no download happens under
+# --check, so extraction would fail. See the note in that role.
+- name: "agent | (check mode) Report what would be installed"
+  ansible.builtin.debug:
+    msg: >-
+      Would install {{ otel_agent_dist }} {{ otel_agent_version }} (installed:
+      {{ _oa_installed if (_oa_installed | length > 0) else 'absent' }}).
+      Download and extraction are skipped under --check.
+  when:
+    - _oa_install | bool
+    - ansible_check_mode
+
+- name: "agent | Install {{ otel_agent_dist }} v{{ otel_agent_version }}"
+  when:
+    - _oa_install | bool
+    - not ansible_check_mode
+  block:
+    - name: "agent | Fetch official checksums for the release"
+      ansible.builtin.uri:
+        url: "{{ _oa_base_url }}/{{ _oa_sums }}"
+        return_content: true
+        timeout: 30
+      register: _oa_sumfile
+      check_mode: false
+
+    - name: "agent | Extract the digest for our artifact"
+      ansible.builtin.set_fact:
+        _oa_sha256: >-
+          {{ (_oa_sumfile.content.splitlines()
+              | select('search', '\s' ~ (_oa_tarball | regex_escape) ~ '$')
+              | first).split()[0] }}
+
+    - name: "agent | Verify a digest was actually found"
+      ansible.builtin.assert:
+        that:
+          - _oa_sha256 is defined
+          - _oa_sha256 | length == 64
+        fail_msg: >-
+          No SHA256 for {{ _oa_tarball }} in {{ _oa_sums }}. Refusing to install
+          an unverified binary. If upstream changed its asset naming, adjust
+          otel_agent_dist / the _oa_tarball fact.
+        quiet: true
+
+    - name: "agent | Create staging directory"
+      ansible.builtin.file:
+        path: "/tmp/otelcol-{{ otel_agent_version }}.stage"
+        state: directory
+        mode: '0700'
+
+    - name: "agent | Download release tarball (checksum enforced)"
+      ansible.builtin.get_url:
+        url: "{{ _oa_base_url }}/{{ _oa_tarball }}"
+        dest: "/tmp/otelcol-{{ otel_agent_version }}.stage/{{ _oa_tarball }}"
+        checksum: "sha256:{{ _oa_sha256 }}"
+        mode: '0600'
+        timeout: 120
+
+    - name: "agent | Extract"
+      ansible.builtin.unarchive:
+        src: "/tmp/otelcol-{{ otel_agent_version }}.stage/{{ _oa_tarball }}"
+        dest: "/tmp/otelcol-{{ otel_agent_version }}.stage"
+        remote_src: true
+
+    - name: "agent | Install binary"
+      ansible.builtin.copy:
+        src: "/tmp/otelcol-{{ otel_agent_version }}.stage/{{ otel_agent_dist }}"
+        dest: "{{ otel_agent_install_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+        remote_src: true
+      notify: Restart otel agent
+
+  always:
+    - name: "agent | Remove staging directory"
+      ansible.builtin.file:
+        path: "/tmp/otelcol-{{ otel_agent_version }}.stage"
+        state: absent
+
+# ------------------------------------------------------------------------------
+# Credential — EnvironmentFile only
+# ------------------------------------------------------------------------------
+- name: "agent | Render credential environment file"
+  ansible.builtin.template:
+    src: otelcol.env.j2
+    dest: "{{ otel_agent_config_dir }}/otelcol.env"
+    owner: root
+    group: "{{ otel_agent_group }}"
+    mode: '0640'
+  no_log: true
+  notify: Restart otel agent
+
+# ------------------------------------------------------------------------------
+# Config — rendered, validated by the collector itself, then promoted
+# ------------------------------------------------------------------------------
+- name: "agent | Render config to a staging path"
+  ansible.builtin.template:
+    src: otelcol.yaml.j2
+    dest: "{{ otel_agent_config_dir }}/config.yaml.staged"
+    owner: root
+    group: "{{ otel_agent_group }}"
+    mode: '0640'
+  changed_when: false
+
+- name: "agent | Does this build support the validate subcommand?"
+  ansible.builtin.shell:
+    cmd: "{{ otel_agent_install_path }} --help 2>&1 | grep -qw validate"
+  register: _oa_has_validate
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "agent | Validate the rendered config before it goes live"
+  ansible.builtin.command:
+    argv:
+      - "{{ otel_agent_install_path }}"
+      - "validate"
+      - "--config={{ otel_agent_config_dir }}/config.yaml.staged"
+  environment:
+    # validate resolves ${env:...} references, so the placeholder must exist.
+    JMDT_OTEL_TOKEN: "validation-placeholder"
+  register: _oa_validate
+  changed_when: false
+  check_mode: false
+  when:
+    - _oa_has_validate.rc is defined
+    - _oa_has_validate.rc == 0
+    - not ansible_check_mode
+
+- name: "agent | Promote validated config"
+  ansible.builtin.copy:
+    src: "{{ otel_agent_config_dir }}/config.yaml.staged"
+    dest: "{{ otel_agent_config_dir }}/config.yaml"
+    remote_src: true
+    owner: root
+    group: "{{ otel_agent_group }}"
+    mode: '0640'
+  notify: Restart otel agent
+
+- name: "agent | Remove staged config"
+  ansible.builtin.file:
+    path: "{{ otel_agent_config_dir }}/config.yaml.staged"
+    state: absent
+  changed_when: false
+
+- name: "agent | Install systemd unit"
+  ansible.builtin.template:
+    src: otelcol.service.j2
+    dest: /etc/systemd/system/otelcol-contrib.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart otel agent
+
+# Both `enabled` and `state` follow telemetry.enabled. Previously `enabled` was
+# unconditional, so telemetry.enabled=false stopped the agent now and started it
+# again on the next reboot.
+- name: "agent | Enable and start"
+  ansible.builtin.systemd:
+    name: otelcol-contrib
+    enabled: "{{ telemetry.enabled | default(true) | bool }}"
+    state: "{{ 'started' if (telemetry.enabled | default(true) | bool) else 'stopped' }}"
+    daemon_reload: true
+
+- name: "agent | Apply pending restart"
+  ansible.builtin.meta: flush_handlers

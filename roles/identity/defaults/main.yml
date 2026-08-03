@@ -1,0 +1,9 @@
+---
+# When false, an unresolvable name is reported instead of asserted. preflight
+# passes false: operator.yml is filled in Stage 0.5, before jmdn is installed, so
+# node_id: "auto" legitimately has nothing to derive from yet.
+#
+# The config path itself is jmdn_config_path in group_vars/all — verify reads the
+# same file, so a single definition keeps the two roles from ever disagreeing
+# about which config they are describing.
+identity_required: true

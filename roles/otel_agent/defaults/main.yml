@@ -1,0 +1,62 @@
+---
+# ==============================================================================
+# otel_agent — the only component that talks to the network.
+#
+# Scrapes loopback (node_exporter + jmdn app metrics), optionally receives
+# jmdn's own OTLP logs/traces on loopback, and pushes everything to Jupiter
+# Meta's ingest gateway over one outbound HTTPS connection.
+#
+# WHY otelcol-contrib and not Grafana Alloy / vmagent / Prometheus agent-mode:
+#   the observability hub already runs otelcol-contrib 0.144.0. Same binary,
+#   same version, same config language, one CVE feed, one upgrade path.
+#
+# FOOTPRINT NOTE: the contrib distribution bundles every component upstream
+#   ships, which is why the binary is large. The components this kit actually
+#   uses are: prometheus + otlp receivers, memory_limiter/attributes/resource/
+#   batch processors, otlphttp exporter, file_storage extension. A purpose-built
+#   distribution via `ocb` with exactly that list is tracked in
+#   docs/DESIGN.md (D-7) and is a drop-in swap of the two variables
+#   below — deliberately not on the phase-1 critical path, because upstream
+#   releases are signed and checksummed and ours would not be yet.
+# ==============================================================================
+
+otel_agent_version: "0.144.0"
+otel_agent_dist: "otelcol-contrib"
+
+otel_agent_user: "otelcol"
+otel_agent_group: "otelcol"
+otel_agent_install_path: "/usr/local/bin/otelcol-contrib"
+otel_agent_config_dir: "/etc/otelcol"
+otel_agent_state_dir: "/var/lib/otelcol"
+
+# Disk-backed export queue. Without this, a network outage silently discards
+# telemetry; with it, an operator's data survives a multi-hour gap.
+otel_agent_queue_dir: "/var/lib/otelcol/queue"
+otel_agent_queue_size: 2000
+
+# Self-telemetry. Loopback only — the verify role reads this to prove that
+# exports are actually succeeding, which is the operator's evidence that we
+# are receiving their data.
+otel_agent_self_metrics_address: "127.0.0.1:8888"
+
+# Loopback OTLP receiver, used only when telemetry.forward_node_logs is true.
+otel_agent_otlp_grpc: "127.0.0.1:4317"
+otel_agent_otlp_http: "127.0.0.1:4318"
+
+# --- Resource caps ------------------------------------------------------------
+# memory_limiter refuses new data before the cgroup limit kills the process, so
+# back-pressure is graceful rather than a restart loop.
+otel_agent_memory_limit_mib: 128
+otel_agent_memory_spike_mib: 32
+otel_agent_memory_high: "200M"
+otel_agent_memory_max: "256M"
+otel_agent_cpu_quota: "20%"
+
+# Batch window. Chosen with the gateway's per-client request budget in mind:
+# at a 30s scrape and a 10s batch window, a node makes roughly 6 export
+# requests per minute per signal — comfortably inside the 100r/m per-client
+# limit even for an operator running several nodes on one token.
+otel_agent_batch_timeout: "10s"
+otel_agent_batch_size: 8192
+
+otel_agent_log_level: "warn"

@@ -1,0 +1,97 @@
+---
+# ==============================================================================
+# identity — resolve this node's name once, from one source of truth.
+#
+# A node's name used to be typed in three places: node_id here, node.alias in
+# jmdn.yaml, and logging.service_name in jmdn.yaml. Three hand-typed copies of
+# one string is three chances to drift, and drift means metrics, logs and traces
+# land under different names and cannot be correlated during an incident.
+#
+# node.alias is the natural source of truth: it is the node's own identity, the
+# name the network registers it under. So node_id: "auto" derives from it.
+#
+# Read-only. This role never writes jmdn.yaml — changing node.alias requires a
+# jmdn restart, and a telemetry playbook must never restart a validator.
+# ==============================================================================
+
+- name: "identity | Look for jmdn's config"
+  ansible.builtin.stat:
+    path: "{{ jmdn_config_path }}"
+  register: _id_cfg
+
+# no_log: jmdn.yaml holds jwt_secret, explorer_api_key and DB passwords. Only
+# node.alias is extracted from it below.
+- name: "identity | Read jmdn's config"
+  ansible.builtin.slurp:
+    src: "{{ jmdn_config_path }}"
+  register: _id_raw
+  no_log: true
+  when:
+    - _id_cfg.stat.exists | default(false)
+    - (node_id | default('') | trim) == 'auto'
+
+# Two branches, mutually exclusive and exhaustive: node_id is either "auto" or it
+# is not. Both always set BOTH facts.
+#
+# Deliberately not guarded with `jmdn_node_id is not defined` — group_vars always
+# defines it as a fallback so role-less playbooks stay evaluable, so that guard
+# can never fire and would leave _id_source unset.
+#
+# An unresolved name (empty) is legitimate at Stage 0: operator.yml is filled
+# before jmdn is installed, so there is no node.alias to read yet. It becomes an
+# error only when something needs the name — observability.yml and verify.yml
+# assert below; preflight passes identity_required=false and merely reports.
+- name: "identity | Take the node name from jmdn's node.alias"
+  ansible.builtin.set_fact:
+    jmdn_node_id: >-
+      {{ (((_id_raw.content | b64decode | from_yaml) | default({}, true)).node
+          | default({})).alias | default('') | trim
+         if (_id_raw.content is defined) else '' }}
+    _id_source: >-
+      {{ ('node.alias in ' ~ jmdn_config_path)
+         if (_id_raw.content is defined) else 'unresolved (jmdn not installed yet)' }}
+  when: (node_id | default('') | trim) == 'auto'
+
+- name: "identity | Use the explicit node_id"
+  ansible.builtin.set_fact:
+    jmdn_node_id: "{{ node_id | default('') | trim }}"
+    _id_source: "node_id in operator.yml"
+  when: (node_id | default('') | trim) != 'auto'
+
+- name: "identity | The node name must be resolved and well-formed"
+  ansible.builtin.assert:
+    that:
+      - jmdn_node_id | length > 0
+      - not (jmdn_node_id is match('CHANGE_ME'))
+      - not (jmdn_node_id is match('<'))
+      - jmdn_node_id is match('^[a-z0-9][a-z0-9-]{1,62}$')
+    fail_msg: >-
+      Cannot determine this node's name.
+      {% if (node_id | default('') | trim) == 'auto' %}
+      node_id is "auto", so it comes from node.alias in {{ jmdn_config_path }} —
+      but that resolved to "{{ jmdn_node_id }}".
+      {% if not (_id_cfg.stat.exists | default(false)) %}
+      {{ jmdn_config_path }} does not exist: install jmdn first (Stage 1), or set
+      node_id explicitly in operator.yml if this machine will never run a node.
+      {% else %}
+      Set node.alias in {{ jmdn_config_path }} to a lowercase [a-z0-9-] name of
+      2-63 characters, unique across every node you run.
+      {% endif %}
+      {% else %}
+      node_id in operator.yml is "{{ jmdn_node_id }}". It must be lowercase
+      [a-z0-9-], 2-63 characters, and unique across every node you run — it
+      becomes the `server` label on every metric.
+      {% endif %}
+    quiet: true
+  when: identity_required | default(true) | bool
+
+- name: "identity | Node name"
+  ansible.builtin.debug:
+    msg: >-
+      {% if jmdn_node_id | length > 0 %}
+      node name "{{ jmdn_node_id }}" (from {{ _id_source }})
+      {% else %}
+      NOTE: node name not resolvable yet — node_id is "auto" and jmdn is not
+      installed on this machine. That is expected before Stage 1; it will resolve
+      from node.alias once {{ jmdn_config_path }} exists.
+      {% endif %}

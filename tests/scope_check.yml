@@ -1,0 +1,54 @@
+---
+# ==============================================================================
+# tests/scope_check.yml — regression gate for cross-role variable scope.
+#
+# verify.yml runs NONE of the install roles, so any variable it reads must come
+# from group_vars/all, not from a role's defaults/. Review found three variables
+# that silently fell back to hardcoded defaults, and one group_vars entry that no
+# role read at all. This test fails if that regresses.
+#
+#   ansible-playbook tests/scope_check.yml -e @tests/fixtures/operator.test.yml
+# ==============================================================================
+- name: "Cross-role variable scope"
+  hosts: operator_node
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../profiles/mainnet.yml"
+  tasks:
+    - name: "Variables read by verify.yml resolve without any role"
+      ansible.builtin.assert:
+        that:
+          - jmdn_config_path is defined
+          - jmdn_health_interval_seconds is defined
+          - node_exporter_listen_address is defined
+          - otel_agent_self_metrics_address is defined
+          - node_exporter_group is defined
+          - jmdn_nologin_shell is defined
+          - jmdn_identity.server == node_id
+          - jmdn_identity.chain_id == '7000700'
+        fail_msg: "a variable verify.yml depends on is not in group_vars/all"
+        quiet: true
+
+    - name: "The shared textfile path reaches BOTH role variable names"
+      ansible.builtin.assert:
+        that:
+          - node_exporter_textfile_dir == jmdn_textfile_dir
+          - jmdn_health_textfile_dir == jmdn_textfile_dir
+        fail_msg: >-
+          jmdn_textfile_dir is set but one of the role-specific names does not
+          follow it — the writer and the reader would disagree on the path.
+        quiet: true
+
+    - name: "nologin path matches this OS family"
+      ansible.builtin.assert:
+        that:
+          - jmdn_nologin_shell == ('/usr/sbin/nologin' if ansible_facts['os_family'] == 'Debian' else '/sbin/nologin')
+        quiet: true
+
+    - name: "Scope check passed"
+      ansible.builtin.debug:
+        msg: >-
+          textfile={{ jmdn_textfile_dir }} interval={{ jmdn_health_interval_seconds }}s
+          nologin={{ jmdn_nologin_shell }} identity={{ jmdn_identity }}

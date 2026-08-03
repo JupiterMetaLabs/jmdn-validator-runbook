@@ -1,0 +1,6 @@
+---
+- name: Restart otel agent
+  ansible.builtin.systemd:
+    name: otelcol-contrib
+    state: restarted
+    daemon_reload: true
