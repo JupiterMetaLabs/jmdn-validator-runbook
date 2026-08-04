@@ -404,7 +404,7 @@ for its own filename.
 |---|---|
 | `SystemMaxUse`, `MaxRetentionSec` | `jmdn-limits.conf` owns them and wins on filename order |
 | `SystemKeepFree` | journald's parser **rejects a percentage**: `Failed to parse SystemKeepFree=15%, ignoring: Invalid argument`, observed on Ubuntu 26.04. The man page states the *default* as 15% of the filesystem, which is the behaviour wanted, so not setting it beats hard-coding a size that cannot scale |
-| `ForwardToSyslog` | a drop-in sorting after ours sets `yes` on a stock node. The earlier claim here — that `/var/log/syslog` is "the only unbounded path" — was never verified, and Ubuntu ships logrotate for rsyslog. Fighting an unidentified component over a key, on a claim that was not checked, is not a trade worth making |
+| `ForwardToSyslog` | a drop-in sorting after ours sets `yes` on a stock node, which is Ubuntu's default. The earlier claim here — that `/var/log/syslog` is "the only unbounded path" — was wrong: `/etc/logrotate.d/rsyslog` is present on a stock Ubuntu 26.04 node, so logrotate already bounds it. The remaining cost is write amplification, ~10–18 MB/day duplicated at the measured idle rate, which is not worth overriding a distro default for |
 | `Compress`, `SyncIntervalSec` | already the defaults; restating one creates a value that can drift out of sync with systemd |
 | `MaxFileSec` | `SystemMaxFileSize` is sufficient — one rotation trigger is easier to reason about than two |
 
