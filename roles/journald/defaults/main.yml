@@ -16,7 +16,12 @@
 # mirror nor the assertion contract can drift unnoticed.
 # ==============================================================================
 
-journald_dropin_name: "10-jmdn-validator.conf"
+journald_dropin_name: "zz-jmdn-validator.conf"
+journald_dropin_legacy_names:
+  - "10-jmdn-validator.conf"      # this role, before it was renamed to sort last
+  - "zz-jmdn-no-syslog.conf"      # emergency-disk-reclaim.sh, so the emergency
+                                  # path converges on the managed drop-in
+journald_logrotate_maxsize: "200M"
 
 journald_max_file_size: "100M"
 journald_rate_limit_interval: "30s"
@@ -32,3 +37,4 @@ journald_directives:
   RateLimitIntervalSec: "{{ journald_rate_limit_interval }}"
   RateLimitBurst: "{{ journald_rate_limit_burst | string }}"
   ForwardToWall: "no"
+  ForwardToSyslog: "no"

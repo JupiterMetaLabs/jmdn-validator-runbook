@@ -404,7 +404,7 @@ for its own filename.
 |---|---|
 | `SystemMaxUse`, `MaxRetentionSec` | `jmdn-limits.conf` owns them and wins on filename order |
 | `SystemKeepFree` | journald's parser **rejects a percentage**: `Failed to parse SystemKeepFree=15%, ignoring: Invalid argument`, observed on Ubuntu 26.04. The man page states the *default* as 15% of the filesystem, which is the behaviour wanted, so not setting it beats hard-coding a size that cannot scale |
-| `ForwardToSyslog` | a drop-in sorting after ours sets `yes` on a stock node, which is Ubuntu's default. The earlier claim here — that `/var/log/syslog` is "the only unbounded path" — was wrong: `/etc/logrotate.d/rsyslog` is present on a stock Ubuntu 26.04 node, so logrotate already bounds it. The remaining cost is write amplification, ~10–18 MB/day duplicated at the measured idle rate, which is not worth overriding a distro default for |
+| `ForwardToSyslog` | **set to `no`. This is the directive that keeps the disk from filling** — see the incident record below |
 | `Compress`, `SyncIntervalSec` | already the defaults; restating one creates a value that can drift out of sync with systemd |
 | `MaxFileSec` | `SystemMaxFileSize` is sufficient — one rotation trigger is easier to reason about than two |
 
@@ -425,6 +425,57 @@ by a package upgrade. `rm` the drop-in and restart journald to revert completely
 3. **`verify.yml` re-runs both** on every invocation, plus reports any "Suppressed
    N messages" entries from the last 24 hours — the only evidence journald leaves
    when it discards logs.
+
+### The `ForwardToSyslog` reversal, and why it is back
+
+**2026-08-10.** A node reached **100% on a 96 GB root filesystem**. Breakdown:
+`/var/log/syslog` **31 GB**, `/var/log/syslog.1` **22 GB** — 53 GB of duplicated
+log text — against a journal of **180 MB** and a chain database of 35 GB.
+
+`ForwardToSyslog=no` shipped in the first version of this role. It was removed on
+two claims, both of which that node falsified:
+
+| Claim made when removing it | Measured |
+|---|---|
+| "logrotate already bounds `/var/log/syslog`" | the distro stanza rotates **weekly with no size cap**, so one file reached 31 GB inside a single window |
+| "the cost is ~10–18 MB/day of write amplification" | **~3.7 GB/day** — roughly 300x that |
+
+**Why the volume cannot be reduced from configuration.** jmdn runs two logging
+systems. `ion` reads `logging.level` (`logging/otelsetup/setup.go:38`,
+`cfg.Level = logCfg.Level`). The other is zerolog's **global** logger, imported by
+16 files with 20 `log.Debug()` call sites — and `zerolog.SetGlobalLevel` is
+**never called anywhere in the jmdn source**. There is no `--log-level` flag and no
+`LOG_LEVEL` environment variable. So `messaging/blockPropagation.go:235`
+
+```go
+log.Debug().Str("peer", remotePeer).Msg("Ignoring message from timed-out peer")
+```
+
+emits regardless of `logging.level: "info"` in `jmdn.yaml`, which is exactly what
+that node showed. Setting the level to `info` changes nothing for these lines.
+
+Bounding where the lines land is therefore the only remediation available to an
+operator, and it is what this role does:
+
+1. **`ForwardToSyslog=no`** — the journal becomes the only sink, and the journal is
+   already bounded by jmdn's own `jmdn-limits.conf` (5G, 30d) which vacuums.
+2. **A global `maxsize` in `/etc/logrotate.conf`** — second, independent layer. A
+   stanza in `logrotate.d` for a path the distro already covers is **not** an
+   option: logrotate prints `duplicate log entry for /var/log/syslog` and **skips
+   the whole file**, verified by test. A global directive forces early rotation on
+   any stanza that only declares a time interval.
+3. **`verify.yml` asserts root-filesystem headroom.** The node that filled up
+   produced no signal from this kit at all.
+
+**The drop-in is named `zz-` so it sorts last.** Two other files set keys we need:
+jmdn's `jmdn-limits.conf`, and the distro's `ForwardToSyslog=yes`. Letters sort
+after digits, so `10-`, `50-` and `99-` all lose to both. The cost is that an
+operator wanting to override a value must edit our file rather than drop one beside
+it — accepted, because losing `ForwardToSyslog` is what filled a disk.
+
+**Open against jmdn, not fixable here:** call `zerolog.SetGlobalLevel` from
+`logging.level` at startup, and rate-limit or demote
+`blockPropagation.go:235`. Until then no operator can turn that log line off.
 
 `tests/doc_claims.py` closes the loop statically: it asserts the assertion map
 matches the directives the template actually writes, that the role defaults mirror

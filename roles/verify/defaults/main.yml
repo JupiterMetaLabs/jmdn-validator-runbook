@@ -81,3 +81,13 @@ verify_loopback_addresses:
   - "::1"
   - "[::1]"
   - "localhost"
+
+# --- Disk headroom -------------------------------------------------------------
+# A real node hit 100% on / with 53 GB of /var/log/syslog. 85% leaves room to
+# notice and act before jmdn cannot write.
+verify_root_disk_pct_max: 85
+
+# With ForwardToSyslog=no the journal is the only sink and jmdn caps it at 5G, so
+# /var/log itself should stay small. 6 GB allows the journal at its cap plus the
+# usual distro files, and flags anything beyond that.
+verify_varlog_mb_max: 6144

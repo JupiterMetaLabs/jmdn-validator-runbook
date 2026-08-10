@@ -500,6 +500,53 @@
       {{ _v_jd_parse.stdout | default('') | trim }}
     quiet: true
 
+# ------------------------------------------------------------------------------
+# 4e. Disk headroom
+#
+# A node ran to 100% on /: 53 GB of it was /var/log/syslog plus its one rotated
+# copy, while the journal holding the same lines was 180 MB. Nothing in this kit
+# noticed. jmdn cannot write blocks on a full disk, so this is a hard failure, not
+# a note.
+# ------------------------------------------------------------------------------
+- name: "verify | Measure disk usage"
+  ansible.builtin.shell: |
+    df -P / | awk 'NR==2 {gsub("%","",$5); print "root_pct=" $5 "\nroot_avail_kb=" $4}'
+    du -sx /var/log 2>/dev/null | awk '{print "varlog_kb=" $1}'
+  args:
+    executable: /bin/bash
+  register: _v_disk
+  changed_when: false
+  check_mode: false
+
+- name: "verify | Parse disk usage"
+  ansible.builtin.set_fact:
+    _v_root_pct: "{{ (_v_disk.stdout | regex_search('root_pct=([0-9]+)', '\\1') | first | default(0)) | int }}"
+    _v_varlog_mb: "{{ ((_v_disk.stdout | regex_search('varlog_kb=([0-9]+)', '\\1') | first | default(0)) | int / 1024) | round | int }}"
+
+- name: "verify | Root filesystem has headroom"
+  ansible.builtin.assert:
+    that:
+      - _v_root_pct | int < verify_root_disk_pct_max | int
+    fail_msg: >-
+      Root filesystem is {{ _v_root_pct }}% full (limit
+      {{ verify_root_disk_pct_max }}%). jmdn cannot write blocks on a full disk.
+      /var/log is {{ _v_varlog_mb }} MB. Largest usual offenders, in order:
+        du -sh /opt/jmdn/data          the chain database — never delete
+        ls -lh /var/log/syslog*        rotated weekly with no size cap by default
+        journalctl --disk-usage        bounded by jmdn's own jmdn-limits.conf
+      If /var/log/syslog is large, this node predates the ForwardToSyslog=no fix:
+      re-run observability.yml, then reclaim with emergency-disk-reclaim.sh.
+    quiet: true
+
+- name: "verify | /var/log is larger than expected"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: /var/log is {{ _v_varlog_mb }} MB, over the
+      {{ verify_varlog_mb_max }} MB this kit expects. With ForwardToSyslog=no the
+      journal is the only sink and jmdn caps it at 5G, so a large /var/log means
+      something else is writing there. Check: ls -lh /var/log/syslog*
+  when: _v_varlog_mb | int > verify_varlog_mb_max | int
+
 - name: "verify | Report any suppressed log messages"
   ansible.builtin.command: journalctl --since '24 hours ago' --grep 'Suppressed [0-9]+ messages'
   register: _v_supp

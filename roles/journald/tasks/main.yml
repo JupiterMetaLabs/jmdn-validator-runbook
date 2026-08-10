@@ -19,6 +19,17 @@
     group: root
     mode: "0755"
 
+# The role previously shipped this drop-in under a numeric prefix. That name loses
+# to jmdn-limits.conf and to the distro's ForwardToSyslog=yes on filename order,
+# so the file was renamed to sort last. Left in place it would still be read, and
+# an operator debugging journald would find two files from the same owner.
+- name: "journald | Remove drop-ins this role shipped under an older name"
+  ansible.builtin.file:
+    path: "/etc/systemd/journald.conf.d/{{ item }}"
+    state: absent
+  loop: "{{ journald_dropin_legacy_names | default([]) }}"
+  notify: "journald config changed"
+
 - name: "journald | Install the retention drop-in"
   ansible.builtin.template:
     src: journald-retention.conf.j2
@@ -134,6 +145,52 @@
   loop: "{{ journald_directives | dict2items }}"
   loop_control:
     label: "{{ item.key }}={{ item.value }}"
+
+# ------------------------------------------------------------------------------
+# Second layer: bound /var/log/syslog by SIZE, not only by time.
+#
+# ForwardToSyslog=no above means rsyslog should now receive almost nothing. This
+# is the belt to that braces: if forwarding is ever re-enabled, or a process
+# writes to syslog directly, the distro's stanza would rotate weekly with no size
+# limit and a chatty process fills the disk inside one window — measured at 31 GB
+# in a single file.
+#
+# A GLOBAL maxsize is used rather than shipping a stanza in logrotate.d, because a
+# second stanza for a path the distro already covers makes logrotate emit
+# "duplicate log entry for /var/log/syslog" and SKIP the whole file — verified by
+# test, and worse than doing nothing. Global directives apply to every stanza that
+# does not override them, and force early rotation on one that only says "weekly".
+# ------------------------------------------------------------------------------
+# Validate the VALUE, not the file. `validate: "logrotate --debug %s"` was tried
+# and rejected: logrotate follows `include /etc/logrotate.d` even on a temp file,
+# so it parses the whole system config, touches /var/lib/logrotate/status and
+# attempts euid switches — it returned rc=1 for reasons having nothing to do with
+# the line being added. A validator that fails for unrelated reasons is worse than
+# none. logrotate has no syntax-only check, and the only realistic failure here is
+# a malformed size, so that is what gets checked.
+- name: "journald | The logrotate size cap must be a size logrotate understands"
+  ansible.builtin.assert:
+    that:
+      - journald_logrotate_maxsize is match('^[0-9]+[kKmMgG]?$')
+    fail_msg: >-
+      journald_logrotate_maxsize is "{{ journald_logrotate_maxsize }}", which
+      logrotate cannot parse. It goes into /etc/logrotate.conf as a GLOBAL
+      directive, so a bad value degrades rotation for every log on the machine.
+      Use bytes or a k/M/G suffix, e.g. 200M.
+    quiet: true
+
+- name: "journald | Bound every rotated log by size, not only by age"
+  ansible.builtin.lineinfile:
+    path: /etc/logrotate.conf
+    line: "maxsize {{ journald_logrotate_maxsize }}"
+    regexp: '^\s*maxsize\s'
+    insertbefore: '^\s*include\s'
+    state: present
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: _jd_logrotate
 
 - name: "journald | Report current journal usage"
   ansible.builtin.command: journalctl --disk-usage

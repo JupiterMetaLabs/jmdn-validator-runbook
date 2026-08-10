@@ -5,13 +5,12 @@
 # set there, and would be silently reverted by a package upgrade. A drop-in
 # layers on top and only states what we change.
 #
-# SCOPE: this file sets ONLY directives that no other component on a JMDN node
-# sets. jmdn's own Scripts/install_services.sh writes
-# /etc/systemd/journald.conf.d/jmdn-limits.conf (SystemMaxUse, MaxRetentionSec),
-# and that filename sorts AFTER this one, so anything we wrote for those keys
-# would be silently overridden. Total journal size is jmdn's to own; the rate
-# limit is ours, and it is the directive that actually loses data.
-# See docs/DESIGN.md D-18.
+# This file is named to sort LAST among journald.conf.d drop-ins. systemd merges
+# them in lexicographic filename order and the last assignment of a key wins.
+# Two other files matter on a JMDN node: jmdn's own installer writes
+# jmdn-limits.conf (SystemMaxUse, MaxRetentionSec), and the distro sets
+# ForwardToSyslog=yes. Letters sort after digits, so a numeric prefix loses to
+# both — hence "zz-". See docs/DESIGN.md D-18.
 #
 # Remove this file and `systemctl restart systemd-journald` to revert entirely.
 [Journal]
@@ -37,6 +36,21 @@ RuntimeMaxUse={{ journald_runtime_max_use }}
 # would need to explain it. Nothing else on a JMDN node sets these.
 RateLimitIntervalSec={{ journald_rate_limit_interval }}
 RateLimitBurst={{ journald_rate_limit_burst }}
+
+# --- Do not duplicate the journal into /var/log/syslog -----------------------
+# THE DIRECTIVE THAT KEEPS THE DISK FROM FILLING.
+#
+# The journal is bounded: jmdn's jmdn-limits.conf caps it at 5G and it vacuums.
+# /var/log/syslog is not — the distro rotates it weekly with no size cap, so a
+# chatty process fills the disk inside one rotation window. Measured on a real
+# node: /var/log/syslog 31 GB, /var/log/syslog.1 22 GB, 53 GB of a 96 GB disk,
+# while the journal holding the same lines was 180 MB.
+#
+# Volume cannot be reduced from configuration. jmdn logs through two systems and
+# only one reads logging.level: zerolog's global level is never set anywhere in
+# the jmdn source, so log.Debug() call sites emit regardless of what jmdn.yaml
+# says. Bounding where the lines land is the only remediation available here.
+ForwardToSyslog=no
 
 # Don't broadcast emergency messages to every terminal.
 ForwardToWall=no

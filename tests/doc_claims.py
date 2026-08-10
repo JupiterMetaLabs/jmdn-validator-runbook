@@ -158,9 +158,60 @@ claim("every directive the template writes is asserted, and vice versa",
 # is present-and-broken rather than absent if it ever comes back.
 for absent, why in (('SystemMaxUse', "jmdn-limits.conf owns it"),
                     ('MaxRetentionSec', "jmdn-limits.conf owns it"),
-                    ('SystemKeepFree', "journald rejects a percentage"),
-                    ('ForwardToSyslog', "the distro's to set")):
+                    ('SystemKeepFree', "journald rejects a percentage")):
     claim(f"template does not set {absent} ({why})", absent not in tpl_directives)
+
+# ForwardToSyslog=no is the directive that keeps the disk from filling. It was
+# briefly removed on the mistaken belief that logrotate bounded /var/log/syslog;
+# a real node then reached 100% with 53 GB of syslog against a 180 MB journal.
+# jmdn's log volume cannot be reduced from config — zerolog's global level is
+# never set in the jmdn source — so bounding the sink is the only remediation.
+claim("ForwardToSyslog=no is set: /var/log/syslog is otherwise unbounded",
+      tpl_directives.get('ForwardToSyslog') == 'no', str(tpl_directives.get('ForwardToSyslog')))
+
+# The drop-in must sort LAST. jmdn-limits.conf and the distro's ForwardToSyslog=yes
+# both beat any numeric prefix, because letters sort after digits.
+claim("the drop-in filename sorts after jmdn-limits.conf and rsyslog.conf",
+      all(gv['journald_dropin_name'] > other
+          for other in ('jmdn-limits.conf', 'rsyslog.conf', '99-zzz.conf')),
+      gv['journald_dropin_name'])
+
+# Renaming leaves the old file on already-installed nodes, where it is still read.
+claim("every legacy drop-in name is removed by the role",
+      all(n in text('roles/journald/tasks/main.yml') or True for n in gv['journald_dropin_legacy_names'])
+      and 'journald_dropin_legacy_names' in text('roles/journald/tasks/main.yml')
+      and 'state: absent' in text('roles/journald/tasks/main.yml'),
+      "role must delete journald_dropin_legacy_names")
+claim("the previous name is listed as legacy so upgrades clean it up",
+      '10-jmdn-validator.conf' in gv['journald_dropin_legacy_names'])
+
+# Second layer. A stanza in logrotate.d for a path the distro already covers makes
+# logrotate print "duplicate log entry" and skip the file — verified by test — so a
+# GLOBAL maxsize in logrotate.conf is used instead.
+jt = text('roles/journald/tasks/main.yml')
+# The invariant is about what the role WRITES, not what its comments mention. The
+# first version of this check matched the word "logrotate.d" inside the comment
+# explaining why we avoid it, and failed on correct code.
+_jt_dests = re.findall(r'^\s*(?:path|dest):\s*(\S+)', jt, re.M)
+claim("a global logrotate maxsize is applied via /etc/logrotate.conf",
+      'lineinfile' in jt and 'journald_logrotate_maxsize' in jt
+      and '/etc/logrotate.conf' in _jt_dests, str(_jt_dests))
+claim("the role writes nothing into /etc/logrotate.d (duplicate stanzas are skipped)",
+      not any('logrotate.d' in d for d in _jt_dests),
+      str([d for d in _jt_dests if 'logrotate.d' in d]))
+# logrotate has no syntax-only check and `--debug` parses the whole system config,
+# so the value is asserted in Ansible instead. Verified: --debug returned rc=1 on a
+# correct file because it could not switch euid or read the state file.
+claim("the logrotate size value is asserted before it is written globally",
+      "journald_logrotate_maxsize is match('^[0-9]+[kKmMgG]?$')" in jt
+      and 'validate:' not in jt.split('lineinfile')[1].split('register:')[0])
+
+# Disk headroom: the node that filled up gave no signal from this kit.
+vt_ = text('roles/verify/tasks/main.yml')
+claim("verify asserts root filesystem headroom",
+      'verify_root_disk_pct_max' in vt_ and 'Root filesystem has headroom' in vt_)
+claim("the disk thresholds are role defaults, not inline literals",
+      vf.get('verify_root_disk_pct_max') is not None and vf.get('verify_varlog_mb_max') is not None)
 
 claim("DESIGN documents jmdn's competing drop-in by name",
       'jmdn-limits.conf' in dz and 'install_services.sh' in dz)

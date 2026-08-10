@@ -52,27 +52,42 @@ jmdn_config_path: /etc/jmdn/jmdn.yaml
 # it, running no install role) need the same values. A role default would force
 # verify to restate them behind default() and the two would drift.
 #
-# Drop-in filename.
+# Drop-in filename. systemd merges every journald.conf.d drop-in in lexicographic
+# FILENAME order and the last assignment of a key wins.
 #
-#   "10-"  systemd merges drop-ins in lexical FILENAME order across every
-#          journald.conf.d directory, and the last assignment of a key wins.
-#          10- is early on purpose: an operator who disagrees with a value can
-#          drop 20-mine.conf beside ours and win without editing our file.
+#   "zz-"  must sort LAST, because two other files set keys we need to control:
+#          jmdn's Scripts/install_services.sh:83 writes jmdn-limits.conf, and the
+#          distro sets ForwardToSyslog=yes. Letters sort after digits in ASCII, so
+#          a numeric prefix — 10-, 50-, even 99- — loses to both. This was measured:
+#          SystemMaxUse=2G in a 10- prefixed file was silently overridden by jmdn's
+#          5G, and the presence-only assertion of the day passed anyway.
 #
-#          It also means we lose to anything alphabetic. jmdn's own
-#          Scripts/install_services.sh:83 writes jmdn-limits.conf, and "j" sorts
-#          after any digit — so a 99- prefix would lose to it too. The response is
-#          not to rename but to not set the keys jmdn owns, and to ASSERT the
-#          effective value of the ones we do. Measured on Ubuntu 26.04:
-#          SystemMaxUse=2G here was silently overridden by jmdn's 5G, and the
-#          old presence-only assertion passed anyway.
+#          Cost of sorting last: an operator who wants to override a value must
+#          edit this file rather than drop one beside it. Accepted — losing
+#          ForwardToSyslog is what filled a 96 GB disk.
 #
 #   name   identifies the OWNER, not the contents. journald.conf.d is
-#          machine-global, so someone finding a setting here needs to know who
-#          put it there. Contrast the ImmuDB drop-in, which sits inside
+#          machine-global, so someone finding a setting here needs to know who put
+#          it there. Contrast the ImmuDB drop-in, which sits inside
 #          immudb.service.d/ where ownership is implicit and so is named for its
 #          effect (10-loopback-only.conf).
-journald_dropin_name: "10-jmdn-validator.conf"
+journald_dropin_name: "zz-jmdn-validator.conf"
+
+# Drop-ins this role shipped under earlier names. Removed on every run so an
+# upgraded node does not end up with two of ours fighting over the same keys.
+journald_dropin_legacy_names:
+  - "10-jmdn-validator.conf"      # this role, before it was renamed to sort last
+  - "zz-jmdn-no-syslog.conf"      # emergency-disk-reclaim.sh, so the emergency
+                                  # path converges on the managed drop-in
+
+# Second, independent layer. journald forwarding is off above, so /var/log/syslog
+# should stay near-empty — but if anything re-enables it, or a process writes to
+# syslog directly, this bounds the damage. A GLOBAL maxsize in logrotate.conf
+# forces early rotation of any stanza that only declares a time interval; the
+# distro's rsyslog stanza declares "weekly" with no size cap, which is how one
+# file reached 31 GB. Verified: a second stanza for the same path is NOT an
+# option — logrotate reports "duplicate log entry" and skips the whole file.
+journald_logrotate_maxsize: "200M"
 
 # Rotate individual journal files at this size — quick to search, and vacuuming
 # reclaims space in reasonable increments. jmdn does not set it.
@@ -110,10 +125,6 @@ journald_runtime_max_use: "100M"
 #                                  Invalid argument" (Ubuntu 26.04). Its built-in
 #                                  default already scales with the filesystem, so
 #                                  not setting it beats hard-coding a size.
-#   ForwardToSyslog                a drop-in sorting after ours sets "yes" on a
-#                                  stock node. Fighting an unidentified component
-#                                  over a key is worse than leaving the distro's
-#                                  behaviour intact.
 #   Compress, SyncIntervalSec      already the defaults; restating one creates a
 #                                  value that can drift out of sync with systemd.
 journald_directives:
@@ -123,6 +134,9 @@ journald_directives:
   RateLimitIntervalSec: "{{ journald_rate_limit_interval }}"
   RateLimitBurst: "{{ journald_rate_limit_burst | string }}"
   ForwardToWall: "no"
+  # The one that keeps the disk from filling. /var/log/syslog is rotated weekly
+  # with no size cap, so a chatty process fills the disk inside one window.
+  ForwardToSyslog: "no"
 
 # Resolved by roles/identity, which honours node_id: "auto" by reading node.alias
 # out of jmdn_config_path. The fallback keeps playbooks that run no roles
