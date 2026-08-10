@@ -125,8 +125,38 @@ claim("both switches TELEMETRY names exist",
       ex['telemetry']['forward_node_logs'] is True and 'forward_node_logs' in tm
       and 'logging.otel.enabled' in tm)
 
+print("-- the inventory guard --")
+# The guard exists because a playbook run from the wrong directory loads no
+# ansible.cfg, matches no hosts, and exits 0 — verified: exit code 0 with
+# "skipping: no hosts matched". For verify.yml that is worse than an error,
+# because it reports success having checked nothing.
+for pb in ('observability.yml', 'verify.yml', 'preflight.yml'):
+    t = text(pb)
+    claim(f"{pb} guards against an unloaded inventory",
+          "groups['operator_node'] is defined" in t
+          and "groups['operator_node'] | length > 0" in t)
+    # tags: always — otherwise any --tags run skips the guard and restores the
+    # silent no-op it exists to prevent.
+    claim(f"{pb}'s guard cannot be skipped by --tags",
+          re.search(r'hosts: localhost.*?tags: always', t, re.S) is not None)
+
+# Every command the RUNBOOK tells an operator to paste must actually show what
+# the surrounding prose says it shows. `grep -A<n>` silently stops being correct
+# when a comment is added above the key, which is how -A4 and then -A6 both
+# shipped while metrics_port sat 10 lines below the header.
+_ex_lines = text('operator.yml.example').split('\n')
+_h = next(i for i, l in enumerate(_ex_lines) if l.startswith('jmdn_endpoints:'))
+for _m in re.finditer(r'grep -A(\d+) .\^jmdn_endpoints:', rb):
+    _deepest = max(i - _h for i, l in enumerate(_ex_lines)
+                   if l.strip().startswith(('explorer_port', 'facade_port', 'metrics_port')))
+    claim(f"RUNBOOK's 'grep -A{_m.group(1)} jmdn_endpoints' reaches every port it tabulates",
+          int(_m.group(1)) >= _deepest, f"need -A{_deepest}")
+
 print("-- safety guarantees --")
-vt = text('roles/verify/tasks/main.yml')
+# BOTH the role and the playbook: the inventory guard added a play to verify.yml
+# itself, which this scanner previously did not look at, so the read-only
+# guarantee would have gone unchecked for anything added there.
+vt = text('roles/verify/tasks/main.yml') + text('verify.yml')
 mods = set(re.findall(r'^\s+ansible\.builtin\.([a-z_]+):', vt, re.M))
 READONLY = {'assert', 'debug', 'set_fact', 'stat', 'slurp', 'uri', 'command', 'service_facts', 'pause'}
 cmds = re.findall(r'ansible\.builtin\.command:\s*(.+)', vt)

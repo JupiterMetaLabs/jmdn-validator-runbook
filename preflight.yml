@@ -14,7 +14,31 @@
 # you configured a port for them.
 #
 # Safe to run at any time. Every task is read-only.
+#
+#   cd /opt/jmdn-validator-runbook && ansible-playbook preflight.yml
 # ==============================================================================
+
+# See the note in observability.yml: ansible.cfg is found relative to the current
+# working directory, so running from elsewhere checks nothing and exits 0.
+- name: "Guard — inventory must be loaded"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: "guard | The operator_node group must be present"
+      ansible.builtin.assert:
+        that:
+          - groups['operator_node'] is defined
+          - groups['operator_node'] | length > 0
+        fail_msg: >-
+          No inventory was loaded, so nothing was checked.
+
+          Run it from the repository:
+            cd /opt/jmdn-validator-runbook
+            ansible-playbook preflight.yml
+        quiet: true
+
 - name: "JMDN operator node — preflight only (read-only)"
   hosts: operator_node
   become: false

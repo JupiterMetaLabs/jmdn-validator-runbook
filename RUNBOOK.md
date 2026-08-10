@@ -703,12 +703,35 @@ nc -vz "$NODE_IP" 8545 && echo "*** JSON-RPC IS PUBLIC — fix before continuing
 
 # Stage 2 — install health reporting
 
-## 2.1 You already have it
+## 2.1 Go to the repository
 
-You cloned this repository and ran `install-deps.sh` in
-[0.5](#05-get-this-runbook-onto-the-machine). Nothing to do here.
+Stage 1 left you in `/opt/jmdn-src`. **Every command from here runs from the
+runbook repository instead:**
 
-If you came straight to Stage 2 because jmdn is already running on this machine:
+```bash
+cd /opt/jmdn-validator-runbook
+```
+
+**This is not cosmetic.** Ansible looks for `ansible.cfg` — which is what points
+it at `inventory.ini` — in the directory you run from, **not** the directory the
+playbook lives in. Run a playbook by absolute path from somewhere else and you
+get:
+
+```
+[WARNING]: No inventory was parsed, only implicit localhost is available
+[WARNING]: Could not match supplied host pattern, ignoring: operator_node
+skipping: no hosts matched
+```
+
+…and an exit code of **0**. Nothing installed, no error. The playbooks now refuse
+to run in that state rather than doing nothing quietly, but the fix is simply to
+`cd` here first.
+
+**Already cloned it in [0.5](#05-get-this-runbook-onto-the-machine)?** Then that
+`cd` is all you need — skip the rest of this section.
+
+**Coming straight to Stage 2 because jmdn already runs on this machine?** Do the
+clone now:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -732,21 +755,34 @@ a second round of configuration — if you installed `jmdn_validator.yaml` in
 [1.6](#16-configure-the-node) unchanged, the ports already agree and there is
 nothing to edit.
 
-Confirm what your node actually serves:
+Confirm what your node actually serves — from `/opt/jmdn-validator-runbook`, so
+the last command finds your `operator.yml`:
 
 ```bash
 grep -A12 '^ports:' /etc/jmdn/jmdn.yaml
 ss -tlnp | grep -E '8090|8545|8081'
-grep -A4 '^jmdn_endpoints:' operator.yml
+grep -E 'explorer_port|facade_port|metrics_port' /opt/jmdn-validator-runbook/operator.yml
 ```
 
-The three ports must match:
+Only these three are probed, and they must match:
 
 | `operator.yml` | `/etc/jmdn/jmdn.yaml` | Default |
 |---|---|---|
 | `explorer_port` | `ports.api` | 8090 |
 | `facade_port` | `ports.facade` | 8545 |
 | `metrics_port` | `ports.metrics` | 8081 |
+
+**WebSocket (8546) is deliberately absent**, even though your node serves it. The
+health collector makes plain HTTP requests; a WebSocket endpoint needs a protocol
+upgrade to answer meaningfully, and it carries no health signal the facade does
+not already give us — block height and chain id both come from `ports.facade`.
+Nothing is wrong if `ws: 8546` is enabled and unlisted here. Same for `did`,
+`cli`, `blockgen`, `blockgrpc` and `profiler`.
+
+`ss` should show `8090` and `8081` on `127.0.0.1`, and `8545` on `*` — the facade
+is your one public listener, by design. See
+[0.2](#if-you-are-not-serving-public-rpc-close-8545-and-8546-too) if you would
+rather it were not.
 
 Use `0` on the `operator.yml` side for any listener you chose not to enable.
 Stage 3 reads your `jmdn.yaml` and fails if the two files disagree, so a mistake
@@ -763,7 +799,10 @@ explorer_api_key: "<the key from your jmdn.yaml>"
 It is used for loopback calls only and is never transmitted. Leave it empty to
 skip those two metrics.
 
-## 2.3 Logs and traces — already on
+## 2.3 Logs and traces — nothing to do
+
+*No commands in this section — it explains a default so you know it is
+deliberate.*
 
 `jmdn_validator.yaml` ships `logging.otel.enabled: true` pointing at
 `127.0.0.1:4317`, so your node's own logs and traces flow through the agent
@@ -783,10 +822,16 @@ re-run `observability.yml`; the agent then stops accepting OTLP and you can set
 ## 2.4 Install
 
 ```bash
+cd /opt/jmdn-validator-runbook
 sudo ansible-playbook observability.yml
 ```
 
-**Expect `failed=0`.** Roughly thirty tasks report `changed` on a first run.
+**Expect `failed=0`**, roughly thirty tasks reporting `changed` on a first run,
+and a `PLAY RECAP` naming `localhost`.
+
+If instead you see `skipping: no hosts matched`, you are not in the repository —
+see [2.1](#21-go-to-the-repository). The playbook now stops with an explanatory
+error in that case rather than exiting 0 having done nothing.
 
 Do not use `--check` on a first install — Ansible cannot simulate services that
 do not exist yet. `--check --diff` becomes useful from the second run onward, to
