@@ -470,11 +470,21 @@ operator, and it is what this role does:
 3. **`verify.yml` asserts root-filesystem headroom.** The node that filled up
    produced no signal from this kit at all.
 
-**The drop-in is named `zz-` so it sorts last.** Two other files set keys we need:
-jmdn's `jmdn-limits.conf`, and the distro's `ForwardToSyslog=yes`. Letters sort
-after digits, so `10-`, `50-` and `99-` all lose to both. The cost is that an
-operator wanting to override a value must edit our file rather than drop one beside
-it — accepted, because losing `ForwardToSyslog` is what filled a disk.
+**The drop-in is named `zz-` so it sorts last.** Both competitors were identified
+on a live node rather than guessed:
+
+| File | Sets | Ships with |
+|---|---|---|
+| `/etc/systemd/journald.conf.d/jmdn-limits.conf` | `SystemMaxUse=5G` | jmdn's `Scripts/install_services.sh:83` |
+| `/usr/lib/systemd/journald.conf.d/syslog.conf` | `ForwardToSyslog=yes` | the `rsyslog` package |
+
+**Filename order beats directory precedence** for differently-named files: a `10-`
+prefixed file in `/etc` was observed losing to `syslog.conf` in `/usr/lib`. Only
+same-name files mask across directories. `z` (0x7a) sorts after `s` (0x73) and `j`
+(0x6a), and every letter after every digit, so `10-`, `50-` and `99-` lose to both
+while `zz-` beats both. The cost is that an operator wanting to override a value
+must edit our file rather than drop one beside it — accepted, because losing
+`ForwardToSyslog` is what filled a disk.
 
 **The role reclaims, not just prevents.** Stopping the growth does not free a disk
 that is already full, and a playbook that fixes fresh installs while leaving a

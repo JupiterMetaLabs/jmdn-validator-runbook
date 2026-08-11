@@ -55,12 +55,21 @@ jmdn_config_path: /etc/jmdn/jmdn.yaml
 # Drop-in filename. systemd merges every journald.conf.d drop-in in lexicographic
 # FILENAME order and the last assignment of a key wins.
 #
-#   "zz-"  must sort LAST, because two other files set keys we need to control:
-#          jmdn's Scripts/install_services.sh:83 writes jmdn-limits.conf, and the
-#          distro sets ForwardToSyslog=yes. Letters sort after digits in ASCII, so
-#          a numeric prefix — 10-, 50-, even 99- — loses to both. This was measured:
-#          SystemMaxUse=2G in a 10- prefixed file was silently overridden by jmdn's
-#          5G, and the presence-only assertion of the day passed anyway.
+#   "zz-"  must sort LAST, because two other files set keys we need to control.
+#          Both identified on a live node, not guessed:
+#            /etc/systemd/journald.conf.d/jmdn-limits.conf   SystemMaxUse=5G
+#              written by jmdn's own Scripts/install_services.sh:83
+#            /usr/lib/systemd/journald.conf.d/syslog.conf    ForwardToSyslog=yes
+#              shipped by the rsyslog package
+#
+#          Filename order beats DIRECTORY precedence for differently-named files:
+#          our 10- file in /etc was overridden by syslog.conf in /usr/lib. Same-name
+#          files mask across directories; different names simply sort. 'z' (0x7a)
+#          sorts after 's' (0x73) and 'j' (0x6a), and every letter sorts after every
+#          digit — so 10-, 50- and 99- all lose to both. Measured twice:
+#          SystemMaxUse=2G was silently overridden by jmdn's 5G while the
+#          presence-only assertion of the day passed anyway, and ForwardToSyslog=no
+#          in a 10- file lost to syslog.conf.
 #
 #          Cost of sorting last: an operator who wants to override a value must
 #          edit this file rather than drop one beside it. Accepted — losing

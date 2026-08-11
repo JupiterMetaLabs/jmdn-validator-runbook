@@ -172,9 +172,12 @@ claim("ForwardToSyslog=no is set: /var/log/syslog is otherwise unbounded",
 
 # The drop-in must sort LAST. jmdn-limits.conf and the distro's ForwardToSyslog=yes
 # both beat any numeric prefix, because letters sort after digits.
-claim("the drop-in filename sorts after jmdn-limits.conf and rsyslog.conf",
+# The two competing filenames, verified on a live node: jmdn-limits.conf in /etc
+# and syslog.conf in /usr/lib. An earlier version of this check guessed
+# "rsyslog.conf" — same first letter, so it passed for the wrong reason.
+claim("the drop-in filename sorts after jmdn-limits.conf and syslog.conf",
       all(gv['journald_dropin_name'] > other
-          for other in ('jmdn-limits.conf', 'rsyslog.conf', '99-zzz.conf')),
+          for other in ('jmdn-limits.conf', 'syslog.conf', '99-zzz.conf')),
       gv['journald_dropin_name'])
 
 # Renaming leaves the old file on already-installed nodes, where it is still read.

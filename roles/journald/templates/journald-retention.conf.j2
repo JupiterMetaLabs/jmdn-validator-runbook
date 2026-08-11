@@ -6,11 +6,12 @@
 # layers on top and only states what we change.
 #
 # This file is named to sort LAST among journald.conf.d drop-ins. systemd merges
-# them in lexicographic filename order and the last assignment of a key wins.
-# Two other files matter on a JMDN node: jmdn's own installer writes
-# jmdn-limits.conf (SystemMaxUse, MaxRetentionSec), and the distro sets
-# ForwardToSyslog=yes. Letters sort after digits, so a numeric prefix loses to
-# both — hence "zz-". See docs/DESIGN.md D-18.
+# them in lexicographic FILENAME order — across every search directory — and the
+# last assignment of a key wins. Two other files matter on a JMDN node:
+#   /etc/systemd/journald.conf.d/jmdn-limits.conf  SystemMaxUse=5G  (jmdn's installer)
+#   /usr/lib/systemd/journald.conf.d/syslog.conf   ForwardToSyslog=yes  (rsyslog pkg)
+# Letters sort after digits and 'z' after 's', so only a "zz-" prefix beats both.
+# See docs/DESIGN.md D-18.
 #
 # Remove this file and `systemctl restart systemd-journald` to revert entirely.
 [Journal]
