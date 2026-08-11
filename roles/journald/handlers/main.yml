@@ -1,0 +1,8 @@
+---
+# Restarting journald is safe and near-instant: systemd holds the log socket, so
+# messages emitted during the restart are queued rather than lost.
+- name: Restart systemd-journald
+  listen: "journald config changed"
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted

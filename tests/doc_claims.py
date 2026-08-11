@@ -12,6 +12,7 @@ Run:  python3 tests/doc_claims.py
 Exit: 0 all claims hold, 1 otherwise.
 """
 import glob
+import os
 import re
 import sys
 import yaml
@@ -125,12 +126,212 @@ claim("both switches TELEMETRY names exist",
       ex['telemetry']['forward_node_logs'] is True and 'forward_node_logs' in tm
       and 'logging.otel.enabled' in tm)
 
+print("-- journald: one source of truth --")
+jd_def = load('roles/journald/defaults/main.yml')
+jd_tpl = text('roles/journald/templates/journald-retention.conf.j2')
+
+
+def jinja_lit(v, scope):
+    """Resolve '{{ var }}' or '{{ var | string }}' against scope; pass literals through."""
+    m = re.fullmatch(r'\{\{\s*([a-z_]+)\s*(?:\|\s*string\s*)?\}\}', str(v).strip())
+    return str(scope[m.group(1)]) if m else str(v)
+
+
+# The role defaults are a deliberate mirror of group_vars (so the role runs
+# standalone). Mirrors drift; this is the only thing that stops it.
+for k in ('journald_dropin_name', 'journald_max_file_size', 'journald_rate_limit_interval',
+          'journald_rate_limit_burst', 'journald_runtime_max_use', 'journald_directives'):
+    claim(f"group_vars and journald defaults agree on {k}",
+          gv[k] == jd_def[k], f"gv={gv[k]!r} role={jd_def[k]!r}")
+
+# The assertion in the role and in verify.yml is only as good as this map matching
+# what the template actually writes. A directive added to one and not the other
+# would be either unasserted or asserted-but-absent.
+tpl_directives = {m.group(1): jinja_lit(m.group(2), gv)
+                  for m in re.finditer(r'^([A-Za-z][A-Za-z0-9]*)=(.+)$', jd_tpl, re.M)}
+map_directives = {k: jinja_lit(v, gv) for k, v in gv['journald_directives'].items()}
+claim("every directive the template writes is asserted, and vice versa",
+      tpl_directives == map_directives,
+      f"template={tpl_directives} map={map_directives}")
+
+# Absences that are load-bearing, not oversights — see group_vars for each.
+# SystemKeepFree in particular is a real key whose value journald rejects, so it
+# is present-and-broken rather than absent if it ever comes back.
+for absent, why in (('SystemMaxUse', "jmdn-limits.conf owns it"),
+                    ('MaxRetentionSec', "jmdn-limits.conf owns it"),
+                    ('SystemKeepFree', "journald rejects a percentage")):
+    claim(f"template does not set {absent} ({why})", absent not in tpl_directives)
+
+# ForwardToSyslog=no is the directive that keeps the disk from filling. It was
+# briefly removed on the mistaken belief that logrotate bounded /var/log/syslog;
+# a real node then reached 100% with 53 GB of syslog against a 180 MB journal.
+# jmdn's log volume cannot be reduced from config — zerolog's global level is
+# never set in the jmdn source — so bounding the sink is the only remediation.
+claim("ForwardToSyslog=no is set: /var/log/syslog is otherwise unbounded",
+      tpl_directives.get('ForwardToSyslog') == 'no', str(tpl_directives.get('ForwardToSyslog')))
+
+# The drop-in must sort LAST. jmdn-limits.conf and the distro's ForwardToSyslog=yes
+# both beat any numeric prefix, because letters sort after digits.
+# The two competing filenames, verified on a live node: jmdn-limits.conf in /etc
+# and syslog.conf in /usr/lib. An earlier version of this check guessed
+# "rsyslog.conf" — same first letter, so it passed for the wrong reason.
+claim("the drop-in filename sorts after jmdn-limits.conf and syslog.conf",
+      all(gv['journald_dropin_name'] > other
+          for other in ('jmdn-limits.conf', 'syslog.conf', '99-zzz.conf')),
+      gv['journald_dropin_name'])
+
+# Renaming leaves the old file on already-installed nodes, where it is still read.
+# `all(n in body or True for n in ...)` was the first version of this and is a
+# TAUTOLOGY — `or True` makes every term true, so it verified nothing while
+# reading as though it did. Verified by evaluating it against a name that appears
+# nowhere. What actually matters is that the role deletes the whole list, so that
+# is what gets asserted.
+_jt_txt = text('roles/journald/tasks/main.yml')
+claim("the role deletes every drop-in in journald_dropin_legacy_names",
+      re.search(r'state: absent\n\s+loop: "\{\{ journald_dropin_legacy_names', _jt_txt) is not None,
+      "the removal task must loop over journald_dropin_legacy_names with state: absent")
+claim("the previous name is listed as legacy so upgrades clean it up",
+      '10-jmdn-validator.conf' in gv['journald_dropin_legacy_names'])
+
+# Second layer. A stanza in logrotate.d for a path the distro already covers makes
+# logrotate print "duplicate log entry" and skip the file — verified by test — so a
+# GLOBAL maxsize in logrotate.conf is used instead.
+jt = text('roles/journald/tasks/main.yml')
+# The invariant is about what the role WRITES, not what its comments mention. The
+# first version of this check matched the word "logrotate.d" inside the comment
+# explaining why we avoid it, and failed on correct code.
+_jt_dests = re.findall(r'^\s*(?:path|dest):\s*(\S+)', jt, re.M)
+claim("a global logrotate maxsize is applied via /etc/logrotate.conf",
+      'lineinfile' in jt and 'journald_logrotate_maxsize' in jt
+      and '/etc/logrotate.conf' in _jt_dests, str(_jt_dests))
+claim("the role writes nothing into /etc/logrotate.d (duplicate stanzas are skipped)",
+      not any('logrotate.d' in d for d in _jt_dests),
+      str([d for d in _jt_dests if 'logrotate.d' in d]))
+# logrotate has no syntax-only check and `--debug` parses the whole system config,
+# so the value is asserted in Ansible instead. Verified: --debug returned rc=1 on a
+# correct file because it could not switch euid or read the state file.
+claim("the logrotate size value is asserted before it is written globally",
+      "journald_logrotate_maxsize is match('^[0-9]+[kKmMgG]?$')" in jt
+      and 'validate:' not in jt.split('lineinfile')[1].split('register:')[0])
+
+# Disk headroom: the node that filled up gave no signal from this kit.
+vt_ = text('roles/verify/tasks/main.yml')
+claim("verify asserts root filesystem headroom",
+      'verify_root_disk_pct_max' in vt_ and 'Root filesystem has headroom' in vt_)
+claim("the disk thresholds are role defaults, not inline literals",
+      vf.get('verify_root_disk_pct_max') is not None and vf.get('verify_varlog_mb_max') is not None)
+
+# The role defaults header lists what is deliberately NOT set. ForwardToSyslog
+# moved out of that list when it started being set, and the header did not follow
+# — found by reading the PR diff, not by any check.
+claim("the role defaults header does not still call ForwardToSyslog unset",
+      "ForwardToSyslog is the distro's" not in text('roles/journald/defaults/main.yml'))
+
+claim("DESIGN documents jmdn's competing drop-in by name",
+      'jmdn-limits.conf' in dz and 'install_services.sh' in dz)
+
+# --- guards for the six defects found reviewing PR #2 --------------------------
+ob = text('observability.yml')
+claim("the journald role is tagged like every other role in observability.yml",
+      re.search(r'- role: journald\n\s+tags: \[', ob) is not None,
+      "an untagged role is skipped by any --tags run")
+
+claim("DESIGN no longer says the fix is not a rename (it is)",
+      'The fix is not a rename' not in dz)
+claim("DESIGN's absence count matches the checks above (3)",
+      'four deliberate absences' not in dz and 'three deliberate absences' in dz)
+claim("ForwardToSyslog is not listed in DESIGN's 'deliberately not set' table",
+      not re.search(r'\|\s*`ForwardToSyslog`\s*\|', dz))
+
+# A failure message that names a file absent from this branch sends the operator
+# looking for something that is not there.
+# Scoped to .sh, which is what an operator is told to RUN, and anchored so it
+# cannot match the "sh" inside `ansible.builtin.shell:` — the first version of
+# this check reported ansible.builtin.sh, operator.yml and test_sync_status.yml,
+# none of which are defects: operator.yml is created by the operator and
+# test_sync_status.yml is an internal file referenced only in a comment.
+_refs = set(re.findall(r'\b([A-Za-z0-9_-]+\.sh)(?![A-Za-z])', text('roles/verify/tasks/main.yml')))
+_missing = sorted(r for r in _refs if not glob.glob(f'**/{r}', recursive=True))
+claim("verify.yml tells the operator to run no script that is absent from the repo",
+      not _missing, str(_missing))
+
+# regex_search(pattern, '\\1') raises inside the filter on no match — verified.
+# Downstream defaulting cannot save it, so the shape is guaranteed in the shell.
+claim("the disk parser uses no capture-group regex_search",
+      "regex_search('root_pct" not in text('roles/verify/tasks/main.yml')
+      and "regex_search('varlog_kb" not in text('roles/verify/tasks/main.yml'))
+claim("an unreadable df fails the disk assert instead of passing it",
+      '_v_root_pct | int > 0' in text('roles/verify/tasks/main.yml'))
+
+print("-- the inventory guard --")
+# The guard exists because a playbook run from the wrong directory loads no
+# ansible.cfg, matches no hosts, and exits 0 — verified: exit code 0 with
+# "skipping: no hosts matched". For verify.yml that is worse than an error,
+# because it reports success having checked nothing.
+for pb in ('observability.yml', 'verify.yml', 'preflight.yml'):
+    t = text(pb)
+    claim(f"{pb} guards against an unloaded inventory",
+          "groups['operator_node'] is defined" in t
+          and "groups['operator_node'] | length > 0" in t)
+    # tags: always — otherwise any --tags run skips the guard and restores the
+    # silent no-op it exists to prevent.
+    claim(f"{pb}'s guard cannot be skipped by --tags",
+          re.search(r'hosts: localhost.*?tags: always', t, re.S) is not None)
+
+# Every command the RUNBOOK tells an operator to paste must actually show what
+# the surrounding prose says it shows. `grep -A<n>` silently stops being correct
+# when a comment is added above the key, which is how -A4 and then -A6 both
+# shipped while metrics_port sat 10 lines below the header.
+_ex_lines = text('operator.yml.example').split('\n')
+_h = next(i for i, l in enumerate(_ex_lines) if l.startswith('jmdn_endpoints:'))
+for _m in re.finditer(r'grep -A(\d+) .\^jmdn_endpoints:', rb):
+    _deepest = max(i - _h for i, l in enumerate(_ex_lines)
+                   if l.strip().startswith(('explorer_port', 'facade_port', 'metrics_port')))
+    claim(f"RUNBOOK's 'grep -A{_m.group(1)} jmdn_endpoints' reaches every port it tabulates",
+          int(_m.group(1)) >= _deepest, f"need -A{_deepest}")
+
+# --- reclaim, and no one-off files left lying around --------------------------
+# The role must fix a BROKEN machine, not only a fresh one. Stopping the growth
+# does not free a disk that is already full.
+claim("the role reclaims oversized logs, not just prevents them",
+      'journald_reclaim_oversized_logs' in jt and 'truncate -s 0' in jt
+      and 'state: absent' in jt)
+claim("active files are truncated and rotated ones deleted, not the reverse",
+      re.search(r'truncate -s 0.*\n\s+loop: "\{\{ _jd_active', jt) is not None
+      and re.search(r'state: absent\n\s+loop: "\{\{ _jd_rotated', jt) is not None)
+claim("reclaim is bounded to /var/log and does not recurse",
+      re.search(r'paths: /var/log\n(?:.*\n)*?\s+recurse: false', jt) is not None
+      and '/opt' not in jt)
+claim("the reclaim threshold matches the logrotate cap it enforces",
+      gv['journald_reclaim_threshold'] == gv['journald_logrotate_maxsize'],
+      f"{gv['journald_reclaim_threshold']} vs {gv['journald_logrotate_maxsize']}")
+claim("the journal is NOT vacuumed (it is the only remaining copy)",
+      'vacuum' not in jt.lower())
+
+# One-off incident files accumulate and then rot. Anything the kit needs must be a
+# role or a documented playbook, not a script an operator has to be handed.
+_root = [f for f in glob.glob('*') if os.path.isfile(f)]
+_oneoff = sorted(f for f in _root
+                 if re.match(r'(?i)^(urgent|emergency|temp|tmp|wip|scratch|draft)', f)
+                 or f.lower().endswith(('-cleanup.md', '-reclaim.sh')))
+claim("no one-off incident script or doc is left in the repo root", not _oneoff, str(_oneoff))
+
 print("-- safety guarantees --")
-vt = text('roles/verify/tasks/main.yml')
+# BOTH the role and the playbook: the inventory guard added a play to verify.yml
+# itself, which this scanner previously did not look at, so the read-only
+# guarantee would have gone unchecked for anything added there.
+vt = text('roles/verify/tasks/main.yml') + text('verify.yml')
 mods = set(re.findall(r'^\s+ansible\.builtin\.([a-z_]+):', vt, re.M))
-READONLY = {'assert', 'debug', 'set_fact', 'stat', 'slurp', 'uri', 'command', 'service_facts', 'pause'}
+# shell is allowed only because every shell body is scanned below, exactly like
+# command. Adding it to this set without that scan would gut the guarantee.
+READONLY = {'assert', 'debug', 'set_fact', 'stat', 'slurp', 'uri', 'command',
+            'service_facts', 'pause', 'shell'}
 cmds = re.findall(r'ansible\.builtin\.command:\s*(.+)', vt)
-mutating_cmds = [x for x in cmds
+shells = re.findall(r'ansible\.builtin\.shell:\s*\|\n(.*?)\n  [a-z]', vt, re.S)
+claim("every shell task in verify was found by the scanner",
+      len(shells) == len(re.findall(r'ansible\.builtin\.shell:', vt)),
+      f"blocks={len(shells)} tasks={len(re.findall(r'ansible.builtin.shell:', vt))}")
+mutating_cmds = [x for x in cmds + shells
                  if re.search(r'\b(restart|start|stop|enable|disable|rm|mv|cp|tee|chmod|chown)\b', x)]
 # service_facts merely READS unit state; matching on the substring "service"
 # would flag it, which is why this enumerates modules instead of pattern-matching.

@@ -46,6 +46,142 @@ jmdn_nologin_shell: >-
 # how the resolution and drift logic get exercised without touching a live node.
 jmdn_config_path: /etc/jmdn/jmdn.yaml
 
+# --- journald ------------------------------------------------------------------
+# Everything journald lives here, not in roles/journald/defaults, because BOTH
+# the journald role (which writes the drop-in) and verify.yml (which re-asserts
+# it, running no install role) need the same values. A role default would force
+# verify to restate them behind default() and the two would drift.
+#
+# Drop-in filename. systemd merges every journald.conf.d drop-in in lexicographic
+# FILENAME order and the last assignment of a key wins.
+#
+#   "zz-"  must sort LAST, because two other files set keys we need to control.
+#          Both identified on a live node, not guessed:
+#            /etc/systemd/journald.conf.d/jmdn-limits.conf   SystemMaxUse=5G
+#              written by jmdn's own Scripts/install_services.sh:83
+#            /usr/lib/systemd/journald.conf.d/syslog.conf    ForwardToSyslog=yes
+#              shipped by the rsyslog package
+#
+#          Filename order beats DIRECTORY precedence for differently-named files:
+#          our 10- file in /etc was overridden by syslog.conf in /usr/lib. Same-name
+#          files mask across directories; different names simply sort. 'z' (0x7a)
+#          sorts after 's' (0x73) and 'j' (0x6a), and every letter sorts after every
+#          digit — so 10-, 50- and 99- all lose to both. Measured twice:
+#          SystemMaxUse=2G was silently overridden by jmdn's 5G while the
+#          presence-only assertion of the day passed anyway, and ForwardToSyslog=no
+#          in a 10- file lost to syslog.conf.
+#
+#          Cost of sorting last: an operator who wants to override a value must
+#          edit this file rather than drop one beside it. Accepted — losing
+#          ForwardToSyslog is what filled a 96 GB disk.
+#
+#   name   identifies the OWNER, not the contents. journald.conf.d is
+#          machine-global, so someone finding a setting here needs to know who put
+#          it there. Contrast the ImmuDB drop-in, which sits inside
+#          immudb.service.d/ where ownership is implicit and so is named for its
+#          effect (10-loopback-only.conf).
+journald_dropin_name: "zz-jmdn-validator.conf"
+
+# Drop-ins this role shipped under earlier names. Removed on every run so an
+# upgraded node does not end up with two of ours fighting over the same keys.
+journald_dropin_legacy_names:
+  - "10-jmdn-validator.conf"      # this role, before it was renamed to sort last
+  - "zz-jmdn-no-syslog.conf"      # emergency-disk-reclaim.sh, so the emergency
+                                  # path converges on the managed drop-in
+
+# Second, independent layer. journald forwarding is off above, so /var/log/syslog
+# should stay near-empty — but if anything re-enables it, or a process writes to
+# syslog directly, this bounds the damage. A GLOBAL maxsize in logrotate.conf
+# forces early rotation of any stanza that only declares a time interval; the
+# distro's rsyslog stanza declares "weekly" with no size cap, which is how one
+# file reached 31 GB. Verified: a second stanza for the same path is NOT an
+# option — logrotate reports "duplicate log entry" and skips the whole file.
+journald_logrotate_maxsize: "200M"
+
+# Rotate individual journal files at this size — quick to search, and vacuuming
+# reclaims space in reasonable increments. jmdn does not set it.
+journald_max_file_size: "100M"
+
+# --- Reclaim on already-broken machines ----------------------------------------
+# The two settings above stop the growth. They do not free what a node has already
+# accumulated: one real node was carrying /var/log/syslog at 31 GB and syslog.1 at
+# 22 GB when the fix arrived. A playbook that fixes fresh installs but leaves a
+# full disk full is half a fix, so the role reclaims too.
+#
+# Safe by construction: only files directly in /var/log, only the names below,
+# only above the same threshold logrotate now enforces. Nothing under /opt is ever
+# touched. On a fresh install nothing matches and the tasks are no-ops, which is
+# also what makes it idempotent.
+journald_reclaim_oversized_logs: true
+
+# Same value as the logrotate cap on purpose: anything larger than the limit we
+# now enforce is by definition legacy bloat from the unbounded era.
+journald_reclaim_threshold: "200M"
+
+# Active files are TRUNCATED, never deleted — rsyslog holds them open, so a delete
+# frees nothing until rsyslog restarts while the blocks stay allocated to a file
+# you can no longer see. Their rotated copies (.1, .2.gz) are closed, so those are
+# deleted outright.
+journald_reclaim_active_names:
+  - syslog
+  - messages
+  - auth.log
+  - kern.log
+  - daemon.log
+  - user.log
+  - debug
+
+# The journal is deliberately NOT vacuumed. With ForwardToSyslog=no it is the only
+# remaining copy of these logs, and jmdn's jmdn-limits.conf already caps it at 5G
+# with 30-day retention. Vacuuming would destroy the record to reclaim space that
+# was never the problem — on the affected node the journal was 180 MB against
+# 53 GB of syslog.
+
+# THE DIRECTIVE THAT ACTUALLY MATTERS.
+# journald DISCARDS messages beyond RateLimitBurst per RateLimitIntervalSec per
+# service, recording only "Suppressed N messages". The default is 10000/30s =
+# 333/sec. A validator at idle was measured at ~2,200 lines/hour from jmdn alone
+# (~18 per 30s), so the default looks generous — but the moment that matters is a
+# block-processing burst, and losing NEW logs during an incident is worse than
+# losing old ones.
+#
+# 100000/30s ≈ 3,300/sec: ~180x measured idle. Deliberately finite rather than 0
+# (unlimited) so a pathological log loop still cannot saturate disk I/O.
+# Nothing else on a JMDN node sets these.
+journald_rate_limit_interval: "30s"
+journald_rate_limit_burst: 100000
+
+# Volatile (RAM) journal cap. Default is 10% of RAM — 800 MB on the 8 GB machine
+# this runbook specifies, which is a lot to lose to logs if /var/log/journal is
+# ever unavailable. jmdn does not set it.
+journald_runtime_max_use: "100M"
+
+# The contract asserted after the restart, and again by verify.yml: every one of
+# these must be the EFFECTIVE value once all drop-ins are merged. tests/ checks
+# this map against the rendered template, so a directive cannot be added to one
+# without the other.
+#
+# Deliberately absent, and why:
+#   SystemMaxUse, MaxRetentionSec  jmdn-limits.conf owns them and wins on
+#                                  filename order (5G / 30d by default).
+#   SystemKeepFree                 journald's parser REJECTS a percentage:
+#                                  "Failed to parse SystemKeepFree=15%, ignoring:
+#                                  Invalid argument" (Ubuntu 26.04). Its built-in
+#                                  default already scales with the filesystem, so
+#                                  not setting it beats hard-coding a size.
+#   Compress, SyncIntervalSec      already the defaults; restating one creates a
+#                                  value that can drift out of sync with systemd.
+journald_directives:
+  Storage: "persistent"
+  SystemMaxFileSize: "{{ journald_max_file_size }}"
+  RuntimeMaxUse: "{{ journald_runtime_max_use }}"
+  RateLimitIntervalSec: "{{ journald_rate_limit_interval }}"
+  RateLimitBurst: "{{ journald_rate_limit_burst | string }}"
+  ForwardToWall: "no"
+  # The one that keeps the disk from filling. /var/log/syslog is rotated weekly
+  # with no size cap, so a chatty process fills the disk inside one window.
+  ForwardToSyslog: "no"
+
 # Resolved by roles/identity, which honours node_id: "auto" by reading node.alias
 # out of jmdn_config_path. The fallback keeps playbooks that run no roles
 # (tests/scope_check.yml) evaluable; set_fact in the role outranks it.

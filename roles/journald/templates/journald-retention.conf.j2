@@ -1,0 +1,57 @@
+# Managed by jmdn-validator-runbook. Local edits will be overwritten.
+#
+# A DROP-IN, not a replacement for /etc/systemd/journald.conf. This machine is
+# yours: overwriting the distro's file would discard anything you or your distro
+# set there, and would be silently reverted by a package upgrade. A drop-in
+# layers on top and only states what we change.
+#
+# This file is named to sort LAST among journald.conf.d drop-ins. systemd merges
+# them in lexicographic FILENAME order — across every search directory — and the
+# last assignment of a key wins. Two other files matter on a JMDN node:
+#   /etc/systemd/journald.conf.d/jmdn-limits.conf  SystemMaxUse=5G  (jmdn's installer)
+#   /usr/lib/systemd/journald.conf.d/syslog.conf   ForwardToSyslog=yes  (rsyslog pkg)
+# Letters sort after digits and 'z' after 's', so only a "zz-" prefix beats both.
+# See docs/DESIGN.md D-18.
+#
+# Remove this file and `systemctl restart systemd-journald` to revert entirely.
+[Journal]
+# Explicit rather than relying on /var/log/journal existing, which is what
+# Storage=auto keys off. Without it a missing directory silently downgrades the
+# journal to RAM-only and every log is lost on reboot.
+Storage=persistent
+
+# --- Size ---------------------------------------------------------------------
+# SystemMaxUse is deliberately absent: jmdn-limits.conf owns it.
+#
+# SystemKeepFree is deliberately absent: journald's parser rejects a percentage
+# here — "Failed to parse SystemKeepFree=15%, ignoring: Invalid argument" —
+# observed on Ubuntu 26.04. The man page states the DEFAULT as 15% of the
+# filesystem, which is the behaviour we wanted, so the correct action is to not
+# set it rather than to hard-code an absolute size that cannot scale.
+SystemMaxFileSize={{ journald_max_file_size }}
+RuntimeMaxUse={{ journald_runtime_max_use }}
+
+# --- Rate limiting ------------------------------------------------------------
+# Beyond this, journald DISCARDS messages. Raised well above the 10000/30s
+# default so a block-processing burst does not silently truncate the logs you
+# would need to explain it. Nothing else on a JMDN node sets these.
+RateLimitIntervalSec={{ journald_rate_limit_interval }}
+RateLimitBurst={{ journald_rate_limit_burst }}
+
+# --- Do not duplicate the journal into /var/log/syslog -----------------------
+# THE DIRECTIVE THAT KEEPS THE DISK FROM FILLING.
+#
+# The journal is bounded: jmdn's jmdn-limits.conf caps it at 5G and it vacuums.
+# /var/log/syslog is not — the distro rotates it weekly with no size cap, so a
+# chatty process fills the disk inside one rotation window. Measured on a real
+# node: /var/log/syslog 31 GB, /var/log/syslog.1 22 GB, 53 GB of a 96 GB disk,
+# while the journal holding the same lines was 180 MB.
+#
+# Volume cannot be reduced from configuration. jmdn logs through two systems and
+# only one reads logging.level: zerolog's global level is never set anywhere in
+# the jmdn source, so log.Debug() call sites emit regardless of what jmdn.yaml
+# says. Bounding where the lines land is the only remediation available here.
+ForwardToSyslog=no
+
+# Don't broadcast emergency messages to every terminal.
+ForwardToWall=no

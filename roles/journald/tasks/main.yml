@@ -1,0 +1,283 @@
+---
+# ==============================================================================
+# journald — stop it discarding logs under load.
+#
+# Runs as part of observability.yml so the operator types nothing extra. It is in
+# scope for this kit for a concrete reason: this kit forwards the node's logs, and
+# a journald rate limit silently truncating them makes both the forwarded copy and
+# the local copy incomplete at the same moment.
+#
+# Every tunable lives in group_vars/all/main.yml, not here — verify.yml asserts
+# the same contract and has to read the same values. See journald_directives.
+# ==============================================================================
+
+- name: "journald | Ensure the drop-in directory exists"
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The role previously shipped this drop-in under a numeric prefix. That name loses
+# to jmdn-limits.conf and to the distro's ForwardToSyslog=yes on filename order,
+# so the file was renamed to sort last. Left in place it would still be read, and
+# an operator debugging journald would find two files from the same owner.
+- name: "journald | Remove drop-ins this role shipped under an older name"
+  ansible.builtin.file:
+    path: "/etc/systemd/journald.conf.d/{{ item }}"
+    state: absent
+  loop: "{{ journald_dropin_legacy_names | default([]) }}"
+  notify: "journald config changed"
+
+- name: "journald | Install the retention drop-in"
+  ansible.builtin.template:
+    src: journald-retention.conf.j2
+    dest: "/etc/systemd/journald.conf.d/{{ journald_dropin_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  # No validate= here on purpose. systemd ships no validator for journald.conf —
+  # `systemd-analyze verify` handles units, and `cat-config` only reads known
+  # prefixes, so it cannot inspect Ansible's temp file. A validate= that cannot
+  # fail is worse than none: it reads like a safety net and is not one. The two
+  # checks below, after the restart, are the real ones.
+  notify: "journald config changed"
+
+# Apply the restart NOW rather than at end of play, so the checks below describe
+# the journald that is actually running.
+- name: "journald | Apply the configuration before verifying it"
+  ansible.builtin.meta: flush_handlers
+
+# ------------------------------------------------------------------------------
+# Check 1 — did journald ACCEPT every line?
+#
+# journald parses its config at startup, reports a bad directive on its own
+# stderr, then carries on with the rest of the file. Nothing else surfaces that:
+# the file is present and correct on disk, cat-config shows the line, the service
+# is active — and the value never took effect. Exactly how SystemKeepFree=15%
+# shipped: a real key name with a value the parser rejects.
+#
+# Filtering on journald's CURRENT MainPID rather than a time window means a stale
+# error from an earlier restart in the same boot cannot cause a false failure,
+# and a corrected config cannot inherit the previous run's complaint.
+# ------------------------------------------------------------------------------
+- name: "journald | Read journald's own startup messages"
+  ansible.builtin.shell: |
+    pid="$(systemctl show -p MainPID --value systemd-journald)"
+    journalctl -b _PID="${pid}" --no-pager 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: _jd_own
+  changed_when: false
+  check_mode: false
+  # journald logs "Journal started" within milliseconds of the restart, but the
+  # entry has to be written and indexed before it can be read back. Retrying
+  # until it appears is what stops the assertion below running against an empty
+  # string and passing vacuously.
+  #
+  # NO failed_when HERE, deliberately. `failed_when: false` overrides retry
+  # exhaustion — verified: the task reports ok after the last attempt and the play
+  # continues, so a journal we could never read would look like a journal with no
+  # errors in it. Without it, exhausting the retries is a hard failure, which is
+  # the correct outcome: we cannot confirm the config was accepted.
+  # `|| true` keeps rc at 0 so only the until condition decides.
+  retries: 5
+  delay: 2
+  until: "'Journal started' in (_jd_own.stdout | default(''))"
+
+- name: "journald | journald accepted every directive we wrote"
+  ansible.builtin.assert:
+    that:
+      - "'Failed to parse' not in (_jd_own.stdout | default(''))"
+      - "'Unknown key name' not in (_jd_own.stdout | default(''))"
+    fail_msg: >-
+      journald REJECTED a directive in
+      /etc/systemd/journald.conf.d/{{ journald_dropin_name }} and silently ignored
+      it, so the file looks correct on disk while the value is not in effect.
+      journald said:
+      {{ (_jd_own.stdout_lines | default([]))
+         | select('search', 'Failed to parse|Unknown key name')
+         | list | join(' / ') }}
+    quiet: true
+
+# ------------------------------------------------------------------------------
+# Check 2 — is our value the one that WON?
+#
+# systemd merges every journald.conf.d drop-in in lexical filename order, last
+# assignment per key winning. Asserting our file appears in cat-config proves only
+# that it was read — which is why the previous version of this check passed on a
+# node where jmdn-limits.conf had already overridden SystemMaxUse. Resolve the
+# merge the way systemd does, then compare.
+# ------------------------------------------------------------------------------
+
+# No pipefail and no failed_when: if systemd-analyze fails or matches nothing,
+# stdout is empty and the assertion below fails naming the directive it could not
+# find — a clearer outcome than a bare non-zero return code, and impossible to
+# skip. A `when: rc == 0` gate here would turn an unreadable config into a pass.
+- name: "journald | Resolve the effective value of every directive"
+  ansible.builtin.shell: |
+    systemd-analyze cat-config systemd/journald.conf \
+      | grep -E '^[A-Za-z][A-Za-z0-9]*=' \
+      | awk '{ k = substr($0, 1, index($0, "=") - 1)
+               v = substr($0, index($0, "=") + 1)
+               m[k] = v }
+             END { for (k in m) print k "=" m[k] }'
+  args:
+    executable: /bin/bash
+  register: _jd_eff
+  changed_when: false
+  check_mode: false
+
+- name: "journald | Our directives are the effective ones"
+  ansible.builtin.assert:
+    that:
+      - (item.key ~ '=' ~ item.value) in (_jd_eff.stdout_lines | default([]))
+    fail_msg: >-
+      {{ item.key }} is not in effect as "{{ item.value }}". Either a drop-in
+      sorting after {{ journald_dropin_name }} overrides it, or journald rejected
+      the value. Effective now:
+      {{ (_jd_eff.stdout_lines | default([])) | select('match', item.key ~ '=')
+         | list | join(', ') | default('unset', true) }}.
+      Compare the merge order with:
+      systemd-analyze cat-config systemd/journald.conf
+    quiet: true
+  loop: "{{ journald_directives | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+# ------------------------------------------------------------------------------
+# Second layer: bound /var/log/syslog by SIZE, not only by time.
+#
+# ForwardToSyslog=no above means rsyslog should now receive almost nothing. This
+# is the belt to that braces: if forwarding is ever re-enabled, or a process
+# writes to syslog directly, the distro's stanza would rotate weekly with no size
+# limit and a chatty process fills the disk inside one window — measured at 31 GB
+# in a single file.
+#
+# A GLOBAL maxsize is used rather than shipping a stanza in logrotate.d, because a
+# second stanza for a path the distro already covers makes logrotate emit
+# "duplicate log entry for /var/log/syslog" and SKIP the whole file — verified by
+# test, and worse than doing nothing. Global directives apply to every stanza that
+# does not override them, and force early rotation on one that only says "weekly".
+# ------------------------------------------------------------------------------
+# Validate the VALUE, not the file. `validate: "logrotate --debug %s"` was tried
+# and rejected: logrotate follows `include /etc/logrotate.d` even on a temp file,
+# so it parses the whole system config, touches /var/lib/logrotate/status and
+# attempts euid switches — it returned rc=1 for reasons having nothing to do with
+# the line being added. A validator that fails for unrelated reasons is worse than
+# none. logrotate has no syntax-only check, and the only realistic failure here is
+# a malformed size, so that is what gets checked.
+- name: "journald | The logrotate size cap must be a size logrotate understands"
+  ansible.builtin.assert:
+    that:
+      - journald_logrotate_maxsize is match('^[0-9]+[kKmMgG]?$')
+    fail_msg: >-
+      journald_logrotate_maxsize is "{{ journald_logrotate_maxsize }}", which
+      logrotate cannot parse. It goes into /etc/logrotate.conf as a GLOBAL
+      directive, so a bad value degrades rotation for every log on the machine.
+      Use bytes or a k/M/G suffix, e.g. 200M.
+    quiet: true
+
+- name: "journald | Bound every rotated log by size, not only by age"
+  ansible.builtin.lineinfile:
+    path: /etc/logrotate.conf
+    line: "maxsize {{ journald_logrotate_maxsize }}"
+    regexp: '^\s*maxsize\s'
+    insertbefore: '^\s*include\s'
+    state: present
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: _jd_logrotate
+
+# ------------------------------------------------------------------------------
+# Reclaim what the unbounded era already accumulated.
+#
+# The drop-in and the logrotate cap stop the growth; neither frees a disk that is
+# already full. One real node was carrying /var/log/syslog at 31 GB and syslog.1
+# at 22 GB — 53 GB of a 96 GB disk — when the fix arrived. A playbook that fixes
+# fresh installs and leaves a broken machine broken is half a fix.
+#
+# Runs AFTER the cap is in place, so the space cannot immediately refill.
+# Restricted to files directly in /var/log, to the names in
+# journald_reclaim_active_names, and to files above the same threshold logrotate
+# now enforces. On a fresh install nothing matches and both tasks are no-ops.
+# ------------------------------------------------------------------------------
+- name: "journald | Find oversized ACTIVE log files"
+  ansible.builtin.find:
+    paths: /var/log
+    patterns: "{{ journald_reclaim_active_names }}"
+    size: "{{ journald_reclaim_threshold }}"
+    file_type: file
+    recurse: false
+  register: _jd_active
+  changed_when: false
+  when: journald_reclaim_oversized_logs | bool
+
+- name: "journald | Find oversized ROTATED log files"
+  ansible.builtin.find:
+    paths: /var/log
+    patterns: "{{ journald_reclaim_active_names | map('regex_replace', '$', '.*') | list }}"
+    size: "{{ journald_reclaim_threshold }}"
+    file_type: file
+    recurse: false
+  register: _jd_rotated
+  changed_when: false
+  when: journald_reclaim_oversized_logs | bool
+
+# TRUNCATE, never delete. rsyslog holds the active file open: a delete frees no
+# space at all until rsyslog restarts, because the blocks stay allocated to a file
+# with no directory entry. truncate returns them immediately, and rsyslog keeps
+# writing to the same descriptor without needing a signal.
+- name: "journald | Truncate the oversized active files"
+  ansible.builtin.command: "truncate -s 0 {{ item.path | quote }}"
+  loop: "{{ _jd_active.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }} ({{ (item.size / 1048576) | round | int }} MB)"
+
+# Rotated copies are closed, so deleting is correct and reclaims immediately.
+- name: "journald | Delete the oversized rotated copies"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _jd_rotated.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }} ({{ (item.size / 1048576) | round | int }} MB)"
+
+- name: "journald | Space reclaimed"
+  ansible.builtin.debug:
+    msg: >-
+      Reclaimed {{ (((_jd_active.files | default([]) | sum(attribute='size'))
+                   + (_jd_rotated.files | default([]) | sum(attribute='size')))
+                   / 1073741824) | round(2) }} GB from /var/log —
+      {{ _jd_active.files | default([]) | length }} active file(s) truncated,
+      {{ _jd_rotated.files | default([]) | length }} rotated file(s) deleted.
+      The journal was deliberately left alone: with ForwardToSyslog=no it is now
+      the only copy of these logs, and jmdn caps it at 5G.
+  when: (_jd_active.files | default([]) | length)
+        + (_jd_rotated.files | default([]) | length) > 0
+
+- name: "journald | Report current journal usage"
+  ansible.builtin.command: journalctl --disk-usage
+  register: _jd_usage
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Reports the cap actually in force rather than one this role sets, because it no
+# longer sets one — jmdn-limits.conf does. Printing our own number while journald
+# enforced a different one is precisely the mistake being corrected here.
+- name: "journald | Journal usage"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _jd_usage.stdout | default('unknown') }}
+      Size cap in force:
+      {{ (_jd_eff.stdout_lines | default([])) | select('match', 'SystemMaxUse=')
+         | list | join(',') | replace('SystemMaxUse=', '')
+         | default('systemd default', true) }}
+      (set by jmdn's own installer, not by this kit).
+      Rate limit: {{ journald_rate_limit_burst }}/{{ journald_rate_limit_interval }},
+      up from the 10000/30s default that discards messages.
+  when: _jd_usage.rc | default(1) == 0

@@ -359,3 +359,157 @@ short and the whole kit auditable by reading it.
 
 ---
 
+## D-18 — Stop journald dropping logs under load
+
+**Decision:** `observability.yml` installs a journald drop-in. The operator runs
+no extra command.
+
+**Why this is in scope for a telemetry kit:** this kit forwards your node's logs.
+A journald rate limit truncates the local copy and the forwarded copy at the same
+instant, so log retention is not somebody else's problem here.
+
+**The setting that matters is the rate limit, not the size.** journald discards
+messages beyond `RateLimitBurst` per `RateLimitIntervalSec` **per service**,
+recording only "Suppressed N messages". The default is 10,000/30s ≈ 333/s. A
+validator at idle was measured at ~2,200 lines/hour from `jmdn` alone (~18 per
+30s), so the default looks generous — but the moment that matters is a
+block-processing burst, and losing *new* logs during an incident is worse than
+losing old ones. Raised to 100,000/30s ≈ 3,300/s: ~180x measured idle,
+deliberately finite rather than `0`, so a pathological log loop still cannot
+saturate disk I/O.
+
+**Total journal size is not ours to set.** jmdn's own
+`Scripts/install_services.sh:83` already writes a second drop-in,
+`/etc/systemd/journald.conf.d/jmdn-limits.conf`, containing
+`SystemMaxUse=5G` and `MaxRetentionSec=30d`. 5 GB with 30-day retention on the
+100 GB disk this runbook specifies is not a problem worth having, so this role
+does not set those two keys.
+
+**Filename order decides who wins, and we learned that twice.** systemd merges
+drop-ins in **lexical filename order**, last assignment per key. The first version
+of this role was named `10-jmdn-validator.conf` and set `SystemMaxUse=2G` anyway.
+On a live node journald reported `max 5G`: `jmdn-limits.conf` won because `j` sorts
+after any digit, the role's own summary printed "capped at 2G", and the assertion
+passed because it only checked that our *filename* appeared in `cat-config`.
+Presence is not effect.
+
+The first response was to stop setting the contested keys and to **assert the
+effective value** of the rest — resolving the merge the way systemd does. That
+assertion is still here and is the more important half. But the second lesson,
+below, was that one contested key had to be won rather than conceded: the distro's
+`ForwardToSyslog=yes`. Hence the rename to `zz-`, which sorts after everything.
+
+**Deliberately not set, each for its own reason:**
+
+*(`ForwardToSyslog` used to be in this list. It is now set to `no` — see the
+incident record below.)*
+
+| Directive | Why not |
+|---|---|
+| `SystemMaxUse`, `MaxRetentionSec` | `jmdn-limits.conf` owns them and wins on filename order |
+| `SystemKeepFree` | journald's parser **rejects a percentage**: `Failed to parse SystemKeepFree=15%, ignoring: Invalid argument`, observed on Ubuntu 26.04. The man page states the *default* as 15% of the filesystem, which is the behaviour wanted, so not setting it beats hard-coding a size that cannot scale |
+| `Compress`, `SyncIntervalSec` | already the defaults; restating one creates a value that can drift out of sync with systemd |
+| `MaxFileSec` | `SystemMaxFileSize` is sufficient — one rotation trigger is easier to reason about than two |
+
+**A drop-in, not a replacement for `journald.conf`.** The operator's machine is
+theirs: overwriting the distro file would discard their settings and be reverted
+by a package upgrade. `rm` the drop-in and restart journald to revert completely.
+
+**Verified by three checks, each covering a way the previous one failed:**
+
+1. **journald accepted every line.** After the restart, its own messages are read
+   back filtered on its *current* `MainPID` and asserted free of `Failed to parse`
+   and `Unknown key name`. A rejected directive is otherwise invisible — the file
+   is correct on disk, `cat-config` shows the line, the service is active, and the
+   value simply never applies. This is what `SystemKeepFree=15%` did.
+2. **Our value is the winning value.** `cat-config` is reduced to one assignment
+   per key, last-wins, and compared against `journald_directives`. This is what
+   catches an override by a later drop-in.
+3. **`verify.yml` re-runs both** on every invocation, plus reports any "Suppressed
+   N messages" entries from the last 24 hours — the only evidence journald leaves
+   when it discards logs.
+
+### The `ForwardToSyslog` reversal, and why it is back
+
+**2026-08-10.** A node reached **100% on a 96 GB root filesystem**. Breakdown:
+`/var/log/syslog` **31 GB**, `/var/log/syslog.1` **22 GB** — 53 GB of duplicated
+log text — against a journal of **180 MB** and a chain database of 35 GB.
+
+`ForwardToSyslog=no` shipped in the first version of this role. It was removed on
+two claims, both of which that node falsified:
+
+| Claim made when removing it | Measured |
+|---|---|
+| "logrotate already bounds `/var/log/syslog`" | the distro stanza rotates **weekly with no size cap**, so one file reached 31 GB inside a single window |
+| "the cost is ~10–18 MB/day of write amplification" | **~3.7 GB/day** — roughly 300x that |
+
+**Why the volume cannot be reduced from configuration.** jmdn runs two logging
+systems. `ion` reads `logging.level` (`logging/otelsetup/setup.go:38`,
+`cfg.Level = logCfg.Level`). The other is zerolog's **global** logger, imported by
+16 files with 20 `log.Debug()` call sites — and `zerolog.SetGlobalLevel` is
+**never called anywhere in the jmdn source**. There is no `--log-level` flag and no
+`LOG_LEVEL` environment variable. So `messaging/blockPropagation.go:235`
+
+```go
+log.Debug().Str("peer", remotePeer).Msg("Ignoring message from timed-out peer")
+```
+
+emits regardless of `logging.level: "info"` in `jmdn.yaml`, which is exactly what
+that node showed. Setting the level to `info` changes nothing for these lines.
+
+Bounding where the lines land is therefore the only remediation available to an
+operator, and it is what this role does:
+
+1. **`ForwardToSyslog=no`** — the journal becomes the only sink, and the journal is
+   already bounded by jmdn's own `jmdn-limits.conf` (5G, 30d) which vacuums.
+2. **A global `maxsize` in `/etc/logrotate.conf`** — second, independent layer. A
+   stanza in `logrotate.d` for a path the distro already covers is **not** an
+   option: logrotate prints `duplicate log entry for /var/log/syslog` and **skips
+   the whole file**, verified by test. A global directive forces early rotation on
+   any stanza that only declares a time interval.
+3. **`verify.yml` asserts root-filesystem headroom.** The node that filled up
+   produced no signal from this kit at all.
+
+**The drop-in is named `zz-` so it sorts last.** Both competitors were identified
+on a live node rather than guessed:
+
+| File | Sets | Ships with |
+|---|---|---|
+| `/etc/systemd/journald.conf.d/jmdn-limits.conf` | `SystemMaxUse=5G` | jmdn's `Scripts/install_services.sh:83` |
+| `/usr/lib/systemd/journald.conf.d/syslog.conf` | `ForwardToSyslog=yes` | the `rsyslog` package |
+
+**Filename order beats directory precedence** for differently-named files: a `10-`
+prefixed file in `/etc` was observed losing to `syslog.conf` in `/usr/lib`. Only
+same-name files mask across directories. `z` (0x7a) sorts after `s` (0x73) and `j`
+(0x6a), and every letter after every digit, so `10-`, `50-` and `99-` lose to both
+while `zz-` beats both. The cost is that an operator wanting to override a value
+must edit our file rather than drop one beside it — accepted, because losing
+`ForwardToSyslog` is what filled a disk.
+
+**The role reclaims, not just prevents.** Stopping the growth does not free a disk
+that is already full, and a playbook that fixes fresh installs while leaving a
+broken machine broken is half a fix. After the cap is in place, the role finds
+files directly in `/var/log` matching a fixed name list and above the same
+threshold logrotate now enforces, then **truncates the active ones and deletes the
+rotated ones**. Truncate rather than delete for the active file: rsyslog holds it
+open, so a delete frees nothing until rsyslog restarts while the blocks stay
+allocated to a file with no directory entry. On a fresh install nothing matches
+and both tasks are no-ops, which is what makes it idempotent — verified against a
+fixture containing an oversized active file, two oversized rotated copies, a small
+file, a name outside the list, and a decoy in a subdirectory: only the first three
+were touched, and a second run changed nothing.
+
+**The journal is deliberately not vacuumed.** With `ForwardToSyslog=no` it is the
+only remaining copy of those lines, and jmdn already caps it at 5 GB with 30-day
+retention. On the affected node the journal was **180 MB** against **53 GB** of
+syslog, so vacuuming would have destroyed the record to reclaim space that was
+never the problem.
+
+**Open against jmdn, not fixable here:** call `zerolog.SetGlobalLevel` from
+`logging.level` at startup, and rate-limit or demote
+`blockPropagation.go:235`. Until then no operator can turn that log line off.
+
+`tests/doc_claims.py` closes the loop statically: it asserts the assertion map
+matches the directives the template actually writes, that the role defaults mirror
+`group_vars`, and that each of the three deliberate absences is still absent while
+`ForwardToSyslog=no` is still present.

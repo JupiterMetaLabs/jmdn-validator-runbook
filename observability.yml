@@ -6,10 +6,46 @@
 # timer, and an OTel agent that pushes to Jupiter Meta's ingest gateway.
 # Does NOT touch jmdn, immudb, redis, or /etc/jmdn/jmdn.yaml.
 #
+#   cd /opt/jmdn-validator-runbook                           # REQUIRED — see below
 #   sudo ansible-playbook observability.yml --check --diff   # dry run
 #   sudo ansible-playbook observability.yml                  # apply
 #   sudo ansible-playbook verify.yml                         # prove it
 # ==============================================================================
+
+# Ansible reads ansible.cfg from the CURRENT WORKING DIRECTORY, not from the
+# playbook's directory. Run this from anywhere else and inventory.ini is never
+# loaded, the operator_node pattern matches nothing, and Ansible prints
+# "skipping: no hosts matched" — then EXITS 0. A silent no-op that looks like a
+# successful install.
+#
+# This guard runs on implicit localhost, which exists with or without an
+# inventory, and turns that silence into an error. Reported by an operator who
+# ran the playbook by absolute path from /opt/jmdn-src.
+- name: "Guard — inventory must be loaded"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: "guard | The operator_node group must be present"
+      ansible.builtin.assert:
+        that:
+          - groups['operator_node'] is defined
+          - groups['operator_node'] | length > 0
+        fail_msg: >-
+          No inventory was loaded, so this playbook would have done NOTHING and
+          still exited successfully.
+
+          Ansible finds ansible.cfg (which points at inventory.ini) relative to
+          the directory you run from — not the directory the playbook is in.
+
+          Fix: run it from the repository.
+            cd /opt/jmdn-validator-runbook
+            sudo ansible-playbook observability.yml
+
+          If you keep the repo elsewhere, cd there instead. Running by absolute
+          path from another directory is what triggers this.
+        quiet: true
 
 - name: "JMDN operator node — observability layer"
   hosts: operator_node
@@ -26,6 +62,11 @@
 
     - role: preflight
       tags: [preflight]
+    # Bound the journal and stop it duplicating into an unbounded /var/log/syslog,
+    # BEFORE the services below start writing to it.
+    - role: journald
+      tags: [journald, logs]
+
     - role: node_exporter
       tags: [node_exporter, metrics]
     - role: jmdn_health_collector
