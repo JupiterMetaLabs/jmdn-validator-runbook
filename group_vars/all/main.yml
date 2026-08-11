@@ -92,6 +92,7 @@ journald_logrotate_maxsize: "200M"
 # Rotate individual journal files at this size — quick to search, and vacuuming
 # reclaims space in reasonable increments. jmdn does not set it.
 journald_max_file_size: "100M"
+
 # --- Reclaim on already-broken machines ----------------------------------------
 # The two settings above stop the growth. They do not free what a node has already
 # accumulated: one real node was carrying /var/log/syslog at 31 GB and syslog.1 at
@@ -126,7 +127,6 @@ journald_reclaim_active_names:
 # with 30-day retention. Vacuuming would destroy the record to reclaim space that
 # was never the problem — on the affected node the journal was 180 MB against
 # 53 GB of syslog.
-
 
 # THE DIRECTIVE THAT ACTUALLY MATTERS.
 # journald DISCARDS messages beyond RateLimitBurst per RateLimitIntervalSec per

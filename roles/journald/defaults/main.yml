@@ -8,8 +8,11 @@
 #
 # The reasoning behind each value, and the list of directives deliberately NOT
 # set (SystemMaxUse and MaxRetentionSec are jmdn's; SystemKeepFree cannot take a
-# percentage; ForwardToSyslog is the distro's), lives in group_vars/all/main.yml.
-# Read it there rather than duplicating it here.
+# percentage), lives in group_vars/all/main.yml. Read it there rather than
+# duplicating it here.
+#
+# ForwardToSyslog was briefly in that list. It is now set to "no" — that single
+# directive is what keeps /var/log/syslog from filling the disk. See D-18.
 #
 # tests/doc_claims.py asserts these literals match group_vars, and that
 # journald_directives matches what the template actually writes, so neither the
@@ -24,6 +27,7 @@ journald_dropin_legacy_names:
 journald_logrotate_maxsize: "200M"
 
 journald_max_file_size: "100M"
+
 # --- Reclaim on already-broken machines ----------------------------------------
 # The two settings above stop the growth. They do not free what a node has already
 # accumulated: one real node was carrying /var/log/syslog at 31 GB and syslog.1 at

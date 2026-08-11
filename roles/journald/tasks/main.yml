@@ -231,14 +231,14 @@
 # space at all until rsyslog restarts, because the blocks stay allocated to a file
 # with no directory entry. truncate returns them immediately, and rsyslog keeps
 # writing to the same descriptor without needing a signal.
-- name: "journald | Truncate them"
+- name: "journald | Truncate the oversized active files"
   ansible.builtin.command: "truncate -s 0 {{ item.path | quote }}"
   loop: "{{ _jd_active.files | default([]) }}"
   loop_control:
     label: "{{ item.path }} ({{ (item.size / 1048576) | round | int }} MB)"
 
 # Rotated copies are closed, so deleting is correct and reclaims immediately.
-- name: "journald | Delete the rotated copies"
+- name: "journald | Delete the oversized rotated copies"
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: absent

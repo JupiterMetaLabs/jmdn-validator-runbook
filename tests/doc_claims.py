@@ -178,11 +178,15 @@ claim("the drop-in filename sorts after jmdn-limits.conf and rsyslog.conf",
       gv['journald_dropin_name'])
 
 # Renaming leaves the old file on already-installed nodes, where it is still read.
-claim("every legacy drop-in name is removed by the role",
-      all(n in text('roles/journald/tasks/main.yml') or True for n in gv['journald_dropin_legacy_names'])
-      and 'journald_dropin_legacy_names' in text('roles/journald/tasks/main.yml')
-      and 'state: absent' in text('roles/journald/tasks/main.yml'),
-      "role must delete journald_dropin_legacy_names")
+# `all(n in body or True for n in ...)` was the first version of this and is a
+# TAUTOLOGY — `or True` makes every term true, so it verified nothing while
+# reading as though it did. Verified by evaluating it against a name that appears
+# nowhere. What actually matters is that the role deletes the whole list, so that
+# is what gets asserted.
+_jt_txt = text('roles/journald/tasks/main.yml')
+claim("the role deletes every drop-in in journald_dropin_legacy_names",
+      re.search(r'state: absent\n\s+loop: "\{\{ journald_dropin_legacy_names', _jt_txt) is not None,
+      "the removal task must loop over journald_dropin_legacy_names with state: absent")
 claim("the previous name is listed as legacy so upgrades clean it up",
       '10-jmdn-validator.conf' in gv['journald_dropin_legacy_names'])
 
@@ -213,6 +217,12 @@ claim("verify asserts root filesystem headroom",
       'verify_root_disk_pct_max' in vt_ and 'Root filesystem has headroom' in vt_)
 claim("the disk thresholds are role defaults, not inline literals",
       vf.get('verify_root_disk_pct_max') is not None and vf.get('verify_varlog_mb_max') is not None)
+
+# The role defaults header lists what is deliberately NOT set. ForwardToSyslog
+# moved out of that list when it started being set, and the header did not follow
+# — found by reading the PR diff, not by any check.
+claim("the role defaults header does not still call ForwardToSyslog unset",
+      "ForwardToSyslog is the distro's" not in text('roles/journald/defaults/main.yml'))
 
 claim("DESIGN documents jmdn's competing drop-in by name",
       'jmdn-limits.conf' in dz and 'install_services.sh' in dz)
