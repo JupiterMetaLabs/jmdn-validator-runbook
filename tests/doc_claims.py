@@ -12,6 +12,7 @@ Run:  python3 tests/doc_claims.py
 Exit: 0 all claims hold, 1 otherwise.
 """
 import glob
+import os
 import re
 import sys
 import yaml
@@ -216,8 +217,97 @@ claim("the disk thresholds are role defaults, not inline literals",
 claim("DESIGN documents jmdn's competing drop-in by name",
       'jmdn-limits.conf' in dz and 'install_services.sh' in dz)
 
+# --- guards for the six defects found reviewing PR #2 --------------------------
+ob = text('observability.yml')
+claim("the journald role is tagged like every other role in observability.yml",
+      re.search(r'- role: journald\n\s+tags: \[', ob) is not None,
+      "an untagged role is skipped by any --tags run")
+
+claim("DESIGN no longer says the fix is not a rename (it is)",
+      'The fix is not a rename' not in dz)
+claim("DESIGN's absence count matches the checks above (3)",
+      'four deliberate absences' not in dz and 'three deliberate absences' in dz)
+claim("ForwardToSyslog is not listed in DESIGN's 'deliberately not set' table",
+      not re.search(r'\|\s*`ForwardToSyslog`\s*\|', dz))
+
+# A failure message that names a file absent from this branch sends the operator
+# looking for something that is not there.
+# Scoped to .sh, which is what an operator is told to RUN, and anchored so it
+# cannot match the "sh" inside `ansible.builtin.shell:` — the first version of
+# this check reported ansible.builtin.sh, operator.yml and test_sync_status.yml,
+# none of which are defects: operator.yml is created by the operator and
+# test_sync_status.yml is an internal file referenced only in a comment.
+_refs = set(re.findall(r'\b([A-Za-z0-9_-]+\.sh)(?![A-Za-z])', text('roles/verify/tasks/main.yml')))
+_missing = sorted(r for r in _refs if not glob.glob(f'**/{r}', recursive=True))
+claim("verify.yml tells the operator to run no script that is absent from the repo",
+      not _missing, str(_missing))
+
+# regex_search(pattern, '\\1') raises inside the filter on no match — verified.
+# Downstream defaulting cannot save it, so the shape is guaranteed in the shell.
+claim("the disk parser uses no capture-group regex_search",
+      "regex_search('root_pct" not in text('roles/verify/tasks/main.yml')
+      and "regex_search('varlog_kb" not in text('roles/verify/tasks/main.yml'))
+claim("an unreadable df fails the disk assert instead of passing it",
+      '_v_root_pct | int > 0' in text('roles/verify/tasks/main.yml'))
+
+print("-- the inventory guard --")
+# The guard exists because a playbook run from the wrong directory loads no
+# ansible.cfg, matches no hosts, and exits 0 — verified: exit code 0 with
+# "skipping: no hosts matched". For verify.yml that is worse than an error,
+# because it reports success having checked nothing.
+for pb in ('observability.yml', 'verify.yml', 'preflight.yml'):
+    t = text(pb)
+    claim(f"{pb} guards against an unloaded inventory",
+          "groups['operator_node'] is defined" in t
+          and "groups['operator_node'] | length > 0" in t)
+    # tags: always — otherwise any --tags run skips the guard and restores the
+    # silent no-op it exists to prevent.
+    claim(f"{pb}'s guard cannot be skipped by --tags",
+          re.search(r'hosts: localhost.*?tags: always', t, re.S) is not None)
+
+# Every command the RUNBOOK tells an operator to paste must actually show what
+# the surrounding prose says it shows. `grep -A<n>` silently stops being correct
+# when a comment is added above the key, which is how -A4 and then -A6 both
+# shipped while metrics_port sat 10 lines below the header.
+_ex_lines = text('operator.yml.example').split('\n')
+_h = next(i for i, l in enumerate(_ex_lines) if l.startswith('jmdn_endpoints:'))
+for _m in re.finditer(r'grep -A(\d+) .\^jmdn_endpoints:', rb):
+    _deepest = max(i - _h for i, l in enumerate(_ex_lines)
+                   if l.strip().startswith(('explorer_port', 'facade_port', 'metrics_port')))
+    claim(f"RUNBOOK's 'grep -A{_m.group(1)} jmdn_endpoints' reaches every port it tabulates",
+          int(_m.group(1)) >= _deepest, f"need -A{_deepest}")
+
+# --- reclaim, and no one-off files left lying around --------------------------
+# The role must fix a BROKEN machine, not only a fresh one. Stopping the growth
+# does not free a disk that is already full.
+claim("the role reclaims oversized logs, not just prevents them",
+      'journald_reclaim_oversized_logs' in jt and 'truncate -s 0' in jt
+      and 'state: absent' in jt)
+claim("active files are truncated and rotated ones deleted, not the reverse",
+      re.search(r'truncate -s 0.*\n\s+loop: "\{\{ _jd_active', jt) is not None
+      and re.search(r'state: absent\n\s+loop: "\{\{ _jd_rotated', jt) is not None)
+claim("reclaim is bounded to /var/log and does not recurse",
+      re.search(r'paths: /var/log\n(?:.*\n)*?\s+recurse: false', jt) is not None
+      and '/opt' not in jt)
+claim("the reclaim threshold matches the logrotate cap it enforces",
+      gv['journald_reclaim_threshold'] == gv['journald_logrotate_maxsize'],
+      f"{gv['journald_reclaim_threshold']} vs {gv['journald_logrotate_maxsize']}")
+claim("the journal is NOT vacuumed (it is the only remaining copy)",
+      'vacuum' not in jt.lower())
+
+# One-off incident files accumulate and then rot. Anything the kit needs must be a
+# role or a documented playbook, not a script an operator has to be handed.
+_root = [f for f in glob.glob('*') if os.path.isfile(f)]
+_oneoff = sorted(f for f in _root
+                 if re.match(r'(?i)^(urgent|emergency|temp|tmp|wip|scratch|draft)', f)
+                 or f.lower().endswith(('-cleanup.md', '-reclaim.sh')))
+claim("no one-off incident script or doc is left in the repo root", not _oneoff, str(_oneoff))
+
 print("-- safety guarantees --")
-vt = text('roles/verify/tasks/main.yml')
+# BOTH the role and the playbook: the inventory guard added a play to verify.yml
+# itself, which this scanner previously did not look at, so the read-only
+# guarantee would have gone unchecked for anything added there.
+vt = text('roles/verify/tasks/main.yml') + text('verify.yml')
 mods = set(re.findall(r'^\s+ansible\.builtin\.([a-z_]+):', vt, re.M))
 # shell is allowed only because every shell body is scanned below, exactly like
 # command. Adding it to this set without that scan would gut the guarantee.

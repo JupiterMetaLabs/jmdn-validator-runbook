@@ -508,10 +508,25 @@
 # noticed. jmdn cannot write blocks on a full disk, so this is a hard failure, not
 # a note.
 # ------------------------------------------------------------------------------
+# The shell GUARANTEES the output shape — always exactly two whitespace-separated
+# integers — so nothing has to be parsed defensively in Jinja.
+#
+# Two earlier attempts were wrong and both were caught by executing them:
+#   regex_search('...([0-9]+)', '\\1') | first | default(0)
+#     -> "'NoneType' object is not iterable" when the line is absent
+#   ... | default([], true) | first | default(0)
+#     -> "'NoneType' object has no attribute 'group'". The crash is INSIDE
+#        regex_search, which calls match.group(1) before any filter can run, so
+#        no amount of defaulting downstream helps.
+# Shaping the data at the source removes the failure mode instead of handling it.
+#
+# root_pct falls back to 0 on purpose: the assert below requires it to be > 0, so
+# a df we could not read FAILS rather than silently passing a disk check.
 - name: "verify | Measure disk usage"
   ansible.builtin.shell: |
-    df -P / | awk 'NR==2 {gsub("%","",$5); print "root_pct=" $5 "\nroot_avail_kb=" $4}'
-    du -sx /var/log 2>/dev/null | awk '{print "varlog_kb=" $1}'
+    root_pct="$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5+0}')"
+    varlog_kb="$(du -sx /var/log 2>/dev/null | awk '{print $1+0}')"
+    echo "${root_pct:-0} ${varlog_kb:-0}"
   args:
     executable: /bin/bash
   register: _v_disk
@@ -520,12 +535,14 @@
 
 - name: "verify | Parse disk usage"
   ansible.builtin.set_fact:
-    _v_root_pct: "{{ (_v_disk.stdout | regex_search('root_pct=([0-9]+)', '\\1') | first | default(0)) | int }}"
-    _v_varlog_mb: "{{ ((_v_disk.stdout | regex_search('varlog_kb=([0-9]+)', '\\1') | first | default(0)) | int / 1024) | round | int }}"
+    _v_root_pct: "{{ ((_v_disk.stdout | trim).split() | first | default(0)) | int }}"
+    _v_varlog_mb: "{{ ((((_v_disk.stdout | trim).split() | last | default(0)) | int) / 1024) | round | int }}"
 
 - name: "verify | Root filesystem has headroom"
   ansible.builtin.assert:
     that:
+      # > 0 as well as < max: a df we could not read must not pass as healthy.
+      - _v_root_pct | int > 0
       - _v_root_pct | int < verify_root_disk_pct_max | int
     fail_msg: >-
       Root filesystem is {{ _v_root_pct }}% full (limit
@@ -534,8 +551,14 @@
         du -sh /opt/jmdn/data          the chain database — never delete
         ls -lh /var/log/syslog*        rotated weekly with no size cap by default
         journalctl --disk-usage        bounded by jmdn's own jmdn-limits.conf
-      If /var/log/syslog is large, this node predates the ForwardToSyslog=no fix:
-      re-run observability.yml, then reclaim with emergency-disk-reclaim.sh.
+      If /var/log/syslog is large, this node predates the ForwardToSyslog=no fix.
+      One command fixes both the cause and the symptom:
+        cd /opt/jmdn-validator-runbook && git pull
+        sudo ansible-playbook observability.yml
+      That stops journald duplicating into syslog, caps rotation by size, and
+      truncates or deletes what has already accumulated.
+      If the disk stays full afterwards, a process is holding a deleted file open
+      and the blocks are not returned: sudo lsof +L1 | head
     quiet: true
 
 - name: "verify | /var/log is larger than expected"

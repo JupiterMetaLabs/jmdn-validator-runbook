@@ -5,7 +5,33 @@
 # Deliberately different from the internal test_sync_status.yml, which
 # temporarily rewrites /etc/jmdn/jmdn.yaml to disable auth and restarts the
 # node. Nothing here writes to disk or restarts a service.
+#
+#   cd /opt/jmdn-validator-runbook && sudo ansible-playbook verify.yml
 # ==============================================================================
+
+# See the note in observability.yml: ansible.cfg is found relative to the current
+# working directory, so running from elsewhere loads no inventory, matches no
+# hosts, and exits 0 having verified nothing. For a health gate that is worse
+# than failing — it reports success without checking anything.
+- name: "Guard — inventory must be loaded"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: "guard | The operator_node group must be present"
+      ansible.builtin.assert:
+        that:
+          - groups['operator_node'] is defined
+          - groups['operator_node'] | length > 0
+        fail_msg: >-
+          No inventory was loaded, so this gate would have checked NOTHING and
+          still reported success.
+
+          Run it from the repository:
+            cd /opt/jmdn-validator-runbook
+            sudo ansible-playbook verify.yml
+        quiet: true
 
 - name: "JMDN operator node — verify"
   hosts: operator_node

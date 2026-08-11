@@ -92,6 +92,41 @@ journald_logrotate_maxsize: "200M"
 # Rotate individual journal files at this size — quick to search, and vacuuming
 # reclaims space in reasonable increments. jmdn does not set it.
 journald_max_file_size: "100M"
+# --- Reclaim on already-broken machines ----------------------------------------
+# The two settings above stop the growth. They do not free what a node has already
+# accumulated: one real node was carrying /var/log/syslog at 31 GB and syslog.1 at
+# 22 GB when the fix arrived. A playbook that fixes fresh installs but leaves a
+# full disk full is half a fix, so the role reclaims too.
+#
+# Safe by construction: only files directly in /var/log, only the names below,
+# only above the same threshold logrotate now enforces. Nothing under /opt is ever
+# touched. On a fresh install nothing matches and the tasks are no-ops, which is
+# also what makes it idempotent.
+journald_reclaim_oversized_logs: true
+
+# Same value as the logrotate cap on purpose: anything larger than the limit we
+# now enforce is by definition legacy bloat from the unbounded era.
+journald_reclaim_threshold: "200M"
+
+# Active files are TRUNCATED, never deleted — rsyslog holds them open, so a delete
+# frees nothing until rsyslog restarts while the blocks stay allocated to a file
+# you can no longer see. Their rotated copies (.1, .2.gz) are closed, so those are
+# deleted outright.
+journald_reclaim_active_names:
+  - syslog
+  - messages
+  - auth.log
+  - kern.log
+  - daemon.log
+  - user.log
+  - debug
+
+# The journal is deliberately NOT vacuumed. With ForwardToSyslog=no it is the only
+# remaining copy of these logs, and jmdn's jmdn-limits.conf already caps it at 5G
+# with 30-day retention. Vacuuming would destroy the record to reclaim space that
+# was never the problem — on the affected node the journal was 180 MB against
+# 53 GB of syslog.
+
 
 # THE DIRECTIVE THAT ACTUALLY MATTERS.
 # journald DISCARDS messages beyond RateLimitBurst per RateLimitIntervalSec per

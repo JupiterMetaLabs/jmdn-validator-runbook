@@ -192,6 +192,73 @@
     backup: true
   register: _jd_logrotate
 
+# ------------------------------------------------------------------------------
+# Reclaim what the unbounded era already accumulated.
+#
+# The drop-in and the logrotate cap stop the growth; neither frees a disk that is
+# already full. One real node was carrying /var/log/syslog at 31 GB and syslog.1
+# at 22 GB — 53 GB of a 96 GB disk — when the fix arrived. A playbook that fixes
+# fresh installs and leaves a broken machine broken is half a fix.
+#
+# Runs AFTER the cap is in place, so the space cannot immediately refill.
+# Restricted to files directly in /var/log, to the names in
+# journald_reclaim_active_names, and to files above the same threshold logrotate
+# now enforces. On a fresh install nothing matches and both tasks are no-ops.
+# ------------------------------------------------------------------------------
+- name: "journald | Find oversized ACTIVE log files"
+  ansible.builtin.find:
+    paths: /var/log
+    patterns: "{{ journald_reclaim_active_names }}"
+    size: "{{ journald_reclaim_threshold }}"
+    file_type: file
+    recurse: false
+  register: _jd_active
+  changed_when: false
+  when: journald_reclaim_oversized_logs | bool
+
+- name: "journald | Find oversized ROTATED log files"
+  ansible.builtin.find:
+    paths: /var/log
+    patterns: "{{ journald_reclaim_active_names | map('regex_replace', '$', '.*') | list }}"
+    size: "{{ journald_reclaim_threshold }}"
+    file_type: file
+    recurse: false
+  register: _jd_rotated
+  changed_when: false
+  when: journald_reclaim_oversized_logs | bool
+
+# TRUNCATE, never delete. rsyslog holds the active file open: a delete frees no
+# space at all until rsyslog restarts, because the blocks stay allocated to a file
+# with no directory entry. truncate returns them immediately, and rsyslog keeps
+# writing to the same descriptor without needing a signal.
+- name: "journald | Truncate them"
+  ansible.builtin.command: "truncate -s 0 {{ item.path | quote }}"
+  loop: "{{ _jd_active.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }} ({{ (item.size / 1048576) | round | int }} MB)"
+
+# Rotated copies are closed, so deleting is correct and reclaims immediately.
+- name: "journald | Delete the rotated copies"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _jd_rotated.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }} ({{ (item.size / 1048576) | round | int }} MB)"
+
+- name: "journald | Space reclaimed"
+  ansible.builtin.debug:
+    msg: >-
+      Reclaimed {{ (((_jd_active.files | default([]) | sum(attribute='size'))
+                   + (_jd_rotated.files | default([]) | sum(attribute='size')))
+                   / 1073741824) | round(2) }} GB from /var/log —
+      {{ _jd_active.files | default([]) | length }} active file(s) truncated,
+      {{ _jd_rotated.files | default([]) | length }} rotated file(s) deleted.
+      The journal was deliberately left alone: with ForwardToSyslog=no it is now
+      the only copy of these logs, and jmdn caps it at 5G.
+  when: (_jd_active.files | default([]) | length)
+        + (_jd_rotated.files | default([]) | length) > 0
+
 - name: "journald | Report current journal usage"
   ansible.builtin.command: journalctl --disk-usage
   register: _jd_usage
